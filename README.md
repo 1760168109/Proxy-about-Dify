@@ -48,7 +48,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | 键 | 默认 | 含义 |
 |:---|:---|:---|
 | `DIFY_BASE_URL` | `https://api.dify.ai/v1` | 上游 |
-| `DIFY_USER_ID` | `Liu Sheng` | Dify user + 本地状态分桶 |
+| `DIFY_USER_ID` | `Liu Sheng`（这是柳生的ID，你要填你自己的） | Dify user + 本地状态分桶 |
 | `DIFY_API_KEY` | 空 | 兜底 Key（优先用请求头） |
 | `HOST` / `PORT` | `127.0.0.1` / `7272` | 监听 |
 | `LOG_REQUESTS` | `1` | 每枪落盘 `data/request_logs/` |
@@ -102,3 +102,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | `terminal.py` | terminal-tool 待决状态、成功判定、会话隔离与过期 |
 | `cache.py` / `sessions.py` / `meter.py` / `log.py` | Read 缓存 / 会话绑定 / 按次账 / 落盘 |
 | `persist.py` | 本地状态共用原语：原子写盘、UTC 时间戳 |
+
+## 如有问题
+
+提交Issues或@柳生
