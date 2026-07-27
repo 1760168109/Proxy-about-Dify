@@ -1,0 +1,9 @@
+.env
+data/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.log
+对话测试/
+好友使用说明与打包清单.md
