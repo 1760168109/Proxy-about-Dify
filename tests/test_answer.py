@@ -74,12 +74,27 @@ def test_accum_node_finished_structured_priority():
 
 def test_structured_reply_cannot_smuggle_terminal_draft():
     accum = DifyStreamAccum()
-    accum.structured_output = {
-        "reply": "[[after_success]]结构化偷渡[[/after_success]]",
-        "tool_calls": [
-            {"name": "Write", "input": {"file_path": "C:\\a.md", "content": "x"}}
-        ],
-    }
+    # 经 ingest 驱动，与生产同路；直接写 accum.structured_output 会让本测试
+    # 在该属性改名或内化后误报红，而行为其实无恙。
+    accum.ingest(
+        {
+            "event": "node_finished",
+            "data": {
+                "node_type": "llm",
+                "outputs": {
+                    "structured_output": {
+                        "reply": "[[after_success]]结构化偷渡[[/after_success]]",
+                        "tool_calls": [
+                            {
+                                "name": "Write",
+                                "input": {"file_path": "C:\\a.md", "content": "x"},
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+    )
     parts = accum.finalize_parts(enable_tools=True)
     assert parts["envelope"] is True
     assert parts["text"] == ""
@@ -95,6 +110,20 @@ def test_accum_plain_text_untouched():
     assert parts["envelope"] is False
     assert parts["stop_reason"] == "end_turn"
     assert parts["text"] == "普通回答，无工具。"
+
+
+def test_accum_decodes_unicode_wire_after_tool_protocol_parsing():
+    answer = (
+        '[[tool_use]]\n{"name":"Write","input":{"file_path":"C:\\\\a.md",'
+        '"content":"灯⟦U+01F4A1⟧与字面⟦⟦U+01F4A1⟧"}}\n[[/tool_use]]'
+    )
+    accum = DifyStreamAccum()
+    accum.ingest({"event": "message", "answer": answer})
+
+    parts = accum.finalize_parts(enable_tools=True, decode_unicode_wire=True)
+
+    assert parts["tool_uses"][0]["input"]["content"] == "灯💡与字面⟦U+01F4A1⟧"
+    assert parts["unicode_wire_decoded"] is True
 
 
 def test_accum_terminal_write_hides_success_draft():
@@ -192,6 +221,34 @@ def test_accum_workflow_error_visible():
     parts = accum.finalize_parts(enable_tools=False)
     assert parts["empty_upstream"] is True
     assert "File validation" in parts["text"]
+
+
+def test_conversation_id_commits_only_after_successful_finalize():
+    seen: list[str] = []
+    failed = DifyStreamAccum()
+    failed.ingest({"event": "error", "conversation_id": "cid-bad", "message": "nope"})
+    failed.finalize_parts(on_conversation_id=seen.append)
+    assert seen == []
+
+    failed_workflow = DifyStreamAccum()
+    failed_workflow.ingest(
+        {"event": "message", "conversation_id": "cid-wf", "answer": "partial"}
+    )
+    failed_workflow.ingest(
+        {
+            "event": "workflow_finished",
+            "conversation_id": "cid-wf",
+            "data": {"status": "completed", "error": "late failure"},
+        }
+    )
+    failed_workflow.finalize_parts(on_conversation_id=seen.append)
+    assert seen == []
+
+    successful = DifyStreamAccum()
+    successful.ingest({"event": "message", "conversation_id": "cid-ok", "answer": "done"})
+    successful.finalize_parts(on_conversation_id=seen.append)
+    successful.finalize_parts(on_conversation_id=seen.append)
+    assert seen == ["cid-ok"]
 
 
 def test_split_think_and_text():
@@ -348,6 +405,25 @@ def test_sse_no_tool_after_success_misuse_shows_text_without_markers():
     assert "[[after_success]]" not in "".join(lines)
 
 
+def test_sse_tools_speculative_prefix_keeps_leading_whitespace_and_tail():
+    answer = "\n" + ("A" * 80)
+    lines = _run_sse(
+        [
+            {"event": "message", "answer": answer},
+            {"event": "message_end"},
+        ],
+        enable_tools=True,
+    )
+    payloads = _payloads(lines)
+    text = "".join(
+        event["delta"]["text"]
+        for event in payloads
+        if event.get("type") == "content_block_delta"
+        and event.get("delta", {}).get("type") == "text_delta"
+    )
+    assert text == answer
+
+
 def test_sse_plain_chat_no_tools():
     lines = _run_sse(
         [
@@ -366,3 +442,33 @@ def test_sse_plain_chat_no_tools():
     assert text == "你好，柳生。"
     deltas = [e for e in evs if e.get("type") == "message_delta"]
     assert deltas[-1]["delta"]["stop_reason"] == "end_turn"
+
+
+def test_sse_decodes_unicode_wire_across_dify_chunks():
+    lines = _run_sse(
+        [
+            {"event": "message", "reasoning_content": "先辨认⟦U+01", "answer": ""},
+            {"event": "message", "reasoning_content": "F4A1⟧再答", "answer": ""},
+            {"event": "message", "answer": "结果⟦U+01"},
+            {"event": "message", "answer": "F4A1⟧与字面⟦⟦"},
+            {"event": "message_end"},
+        ],
+        enable_tools=False,
+        decode_unicode_wire=True,
+    )
+    events = _payloads(lines)
+    reasoning = "".join(
+        event["delta"]["thinking"]
+        for event in events
+        if event.get("type") == "content_block_delta"
+        and event.get("delta", {}).get("type") == "thinking_delta"
+    )
+    text = "".join(
+        event["delta"]["text"]
+        for event in events
+        if event.get("type") == "content_block_delta"
+        and event.get("delta", {}).get("type") == "text_delta"
+    )
+
+    assert reasoning == "先辨认💡再答"
+    assert text == "结果💡与字面⟦"

@@ -1,10 +1,10 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
   Claude Code 自定义 statusLine 脚本（随代理分发，可固化到本机）。
 
   两种用法：
   1) CC statusLine.command 调用（stdin 为 CC 状态 JSON）
-  2) 手动：powershell -NoProfile -File .\statusline-usage.ps1
+  2) 手动：pwsh -NoProfile -File .\statusline-usage.ps1
 
   展示：上下文%（来自 CC）+ 本机按次账本（来自代理 GET /v1/usage）
   代理地址可用环境变量 LAN_PROXY_URL，默认 http://127.0.0.1:7272

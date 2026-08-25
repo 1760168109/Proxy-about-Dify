@@ -1,9 +1,10 @@
 .env
 data/
-__pycache__/
-.pytest_cache/
 *.pyc
 *.pyo
 *.log
-对话测试/
-好友使用说明与打包清单.md
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+岚.yml
+子代理会话修缮执行方案.md

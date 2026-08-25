@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from persist import atomic_write_json, utc_now
+from persist import atomic_write_json, read_json_dict, utc_now
 
 # 每 user 最多保留多少条 CC→Dify 映射（LRU by updated_at）
 MAX_BY_CC = 32
@@ -68,19 +68,11 @@ class SessionStore:
         self.path = path
         self.max_by_cc = max(1, int(max_by_cc))
         self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self._write({})
 
     def _read(self) -> dict[str, Any]:
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            if not raw.strip():
-                return {}
-            data = json.loads(raw)
-            return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return read_json_dict(self.path)
 
     def _write(self, data: dict[str, Any]) -> None:
         atomic_write_json(self.path, data)
@@ -88,15 +80,27 @@ class SessionStore:
     def _bucket(self, data: dict[str, Any], user: str) -> dict[str, Any]:
         b = data.get(user)
         if not isinstance(b, dict):
-            b = {"current": None, "sessions": [], "cc_session_id": None, "by_cc": {}}
+            b = {
+                "current": None,
+                "cc_session_id": None,
+                "by_cc": {},
+                "binding_epoch": 0,
+            }
             data[user] = b
         b.setdefault("current", None)
-        if not isinstance(b.get("sessions"), list):
-            b["sessions"] = []
         b.setdefault("cc_session_id", None)
         if not isinstance(b.get("by_cc"), dict):
             b["by_cc"] = {}
+        try:
+            b["binding_epoch"] = max(0, int(b.get("binding_epoch") or 0))
+        except (TypeError, ValueError):
+            b["binding_epoch"] = 0
         return b
+
+    @staticmethod
+    def _bump_epoch(b: dict[str, Any]) -> int:
+        b["binding_epoch"] = int(b.get("binding_epoch") or 0) + 1
+        return b["binding_epoch"]
 
     def _state_from_bucket(self, user: str, b: dict[str, Any]) -> dict[str, Any]:
         by_cc = b.get("by_cc") if isinstance(b.get("by_cc"), dict) else {}
@@ -111,7 +115,6 @@ class SessionStore:
         return {
             "user": user,
             "current": b.get("current"),
-            "sessions": list(b.get("sessions") or []),
             "cc_session_id": b.get("cc_session_id"),
             "by_cc": by_cc_out,
         }
@@ -150,11 +153,13 @@ class SessionStore:
                         "conversation_id": None,
                         "session_bind": "missing",
                         "cc_session_id": None,
+                        "binding_epoch": int(b.get("binding_epoch") or 0),
                     }
                 return {
                     "conversation_id": cur_s,
                     "session_bind": "missing",
                     "cc_session_id": None,
+                    "binding_epoch": int(b.get("binding_epoch") or 0),
                 }
 
             by_cc = b.get("by_cc") if isinstance(b.get("by_cc"), dict) else {}
@@ -164,11 +169,13 @@ class SessionStore:
                     "conversation_id": mapped,
                     "session_bind": "hit",
                     "cc_session_id": sid,
+                    "binding_epoch": int(b.get("binding_epoch") or 0),
                 }
             return {
                 "conversation_id": None,
                 "session_bind": "miss",
                 "cc_session_id": sid,
+                "binding_epoch": int(b.get("binding_epoch") or 0),
             }
 
     def new_session(
@@ -187,6 +194,7 @@ class SessionStore:
         with self._lock:
             data = self._read()
             b = self._bucket(data, user)
+            self._bump_epoch(b)
             by_cc = b["by_cc"]
             unbound: list[str] = []
             explicit = (cc_session_id or "").strip() or None
@@ -222,14 +230,12 @@ class SessionStore:
             return state
 
     @staticmethod
-    def _touch_session(b: dict[str, Any], cid: str, now: str) -> None:
-        """sessions 档案 upsert + current 指向（switch / remember 共用）。"""
-        for s in b["sessions"]:
-            if isinstance(s, dict) and s.get("id") == cid:
-                s["updated_at"] = now
-                break
-        else:
-            b["sessions"].append({"id": cid, "title": "", "updated_at": now})
+    def _touch_current(b: dict[str, Any], cid: str) -> None:
+        """current 指向（switch / remember 共用）。
+
+        不另存会话档案列表：由 by_cc 的 dify_cid + updated_at 即可复原同一批事实，
+        而那份列表的 title 字段从未有过写入方。
+        """
         b["current"] = cid
 
     def switch(
@@ -245,8 +251,9 @@ class SessionStore:
         with self._lock:
             data = self._read()
             b = self._bucket(data, user)
+            self._bump_epoch(b)
             now = utc_now()
-            self._touch_session(b, cid, now)
+            self._touch_current(b, cid)
 
             sid = (cc_session_id or "").strip() or None
             if not sid:
@@ -267,17 +274,25 @@ class SessionStore:
         conversation_id: str,
         cc_session_id: str | None = None,
         max_by_cc: int | None = None,
-    ) -> None:
+        expected_epoch: int | None = None,
+    ) -> bool:
         """对话成功后写入档案、current，并绑定 CC session_id（唯一成功写入口）。"""
         cid = (conversation_id or "").strip()
         if not cid:
-            return
+            return False
         limit = self.max_by_cc if max_by_cc is None else max(1, int(max_by_cc))
         with self._lock:
             data = self._read()
             b = self._bucket(data, user)
+            if expected_epoch is not None:
+                try:
+                    expected = int(expected_epoch)
+                except (TypeError, ValueError):
+                    return False
+                if int(b.get("binding_epoch") or 0) != expected:
+                    return False
             now = utc_now()
-            self._touch_session(b, cid, now)
+            self._touch_current(b, cid)
 
             sid = (cc_session_id or "").strip() or None
             if sid:
@@ -286,6 +301,7 @@ class SessionStore:
                 self._trim_by_cc(b["by_cc"], limit)
 
             self._write(data)
+            return True
 
     @staticmethod
     def _trim_by_cc(by_cc: dict[str, Any], max_by_cc: int) -> None:
@@ -293,6 +309,8 @@ class SessionStore:
             return
 
         def sort_key(item: tuple[str, Any]) -> str:
+            # 以 ISO 串直接排序：persist.utc_now() 恒定宽度、恒定 +00:00 偏移，
+            # 故字典序等于时序。改动那个格式前须先把本键迁为浮点 epoch。
             _k, ent = item
             return str(ent.get("updated_at") or "") if isinstance(ent, dict) else ""
 

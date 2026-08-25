@@ -23,6 +23,11 @@ from tools import (
     tool_uses_from_calls,
     toolu_id,
 )
+from unicode_wire import (
+    UnicodeWireStreamDecoder,
+    decode_unicode_wire_text,
+    decode_unicode_wire_value,
+)
 
 # 单个 input_json_delta 的载荷上限（长 Write 分片下发）
 _INPUT_JSON_CHUNK = 8000
@@ -99,6 +104,22 @@ def build_text_delta(text: str, index: int = 0) -> dict[str, Any]:
         "type": "content_block_delta",
         "index": index,
         "delta": {"type": "text_delta", "text": text},
+    }
+
+
+def build_tool_use_block_start(index: int, tool_id: str, name: str) -> dict[str, Any]:
+    return {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
+    }
+
+
+def build_input_json_delta(partial_json: str, index: int = 0) -> dict[str, Any]:
+    return {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
     }
 
 
@@ -265,6 +286,7 @@ class DifyStreamAccum:
         "workflow_status",
         "workflow_error",
         "structured_output",
+        "conversation_id_committed",
     )
 
     def __init__(self, *, input_tokens_hint: int = 0) -> None:
@@ -279,6 +301,7 @@ class DifyStreamAccum:
         self.workflow_status: str | None = None
         self.workflow_error: str | None = None
         self.structured_output: dict[str, Any] | None = None
+        self.conversation_id_committed = False
 
     def ingest(
         self, ev: dict[str, Any], *, on_conversation_id=None
@@ -291,10 +314,8 @@ class DifyStreamAccum:
         self.event_counts[etype_key] = self.event_counts.get(etype_key, 0) + 1
 
         cid = ev.get("conversation_id")
-        if isinstance(cid, str) and cid and cid != self.last_cid:
+        if isinstance(cid, str) and cid:
             self.last_cid = cid
-            if on_conversation_id:
-                on_conversation_id(cid)
 
         if etype == "error":
             self.error = (
@@ -330,8 +351,7 @@ class DifyStreamAccum:
 
         if etype == "message_end":
             cid2 = ev.get("conversation_id")
-            if isinstance(cid2, str) and cid2 and on_conversation_id:
-                on_conversation_id(cid2)
+            if isinstance(cid2, str) and cid2:
                 self.last_cid = cid2
             u = extract_dify_usage(ev)
             if u.get("input_tokens"):
@@ -369,6 +389,30 @@ class DifyStreamAccum:
 
         return "other", "", ""
 
+    def _commit_conversation_id(self, callback) -> None:
+        """只在成功收尾后绑定会话，避免失败枪污染 sessions。"""
+        if (
+            self.conversation_id_committed
+            or not self.last_cid
+            or self.error
+            or self.workflow_error
+        ):
+            return
+        if str(self.workflow_status or "").strip().lower() in {
+            "failed",
+            "error",
+            "cancelled",
+            "canceled",
+            "stopped",
+        }:
+            return
+        if callback is not None:
+            try:
+                callback(self.last_cid)
+            except Exception as exc:
+                print("[lan] conversation remember failed open: {!r}".format(exc))
+        self.conversation_id_committed = True
+
     def _structured_parts(self) -> tuple[str, list[dict[str, Any]]] | None:
         so = self.structured_output
         if not isinstance(so, dict) or not so:
@@ -386,6 +430,8 @@ class DifyStreamAccum:
         *,
         enable_tools: bool = False,
         input_tokens_hint: int = 0,
+        decode_unicode_wire: bool = False,
+        on_conversation_id=None,
     ) -> dict[str, Any]:
         """拆 thinking / text / tool_use，补 usage，返回出站摘要结构。"""
         think = self.reasoning_buf.strip()
@@ -449,6 +495,14 @@ class DifyStreamAccum:
                 body = ""
                 structured_reply_dropped = True
 
+        # 隐藏工具协议先解析，线缆表示后还原；工具参数与成功草稿同样递归解码。
+        if decode_unicode_wire:
+            body = decode_unicode_wire_text(body or "")
+            think = decode_unicode_wire_text(think or "")
+            decoded_tools = decode_unicode_wire_value(tool_uses)
+            tool_uses = decoded_tools if isinstance(decoded_tools, list) else []
+            after_success = decode_unicode_wire_text(after_success or "")
+
         empty_upstream = (
             not (body or "").strip() and not tool_uses and not (think or "").strip()
         )
@@ -482,6 +536,7 @@ class DifyStreamAccum:
         )
         self.usage["input_tokens"] = in_tok
         self.usage["output_tokens"] = out_tok
+        self._commit_conversation_id(on_conversation_id)
         return {
             "text": body or "",
             "reasoning": think or "",
@@ -497,6 +552,7 @@ class DifyStreamAccum:
             "after_success_reason": after_success_reason,
             "envelope": envelope,
             "structured_reply_dropped": structured_reply_dropped,
+            "unicode_wire_decoded": bool(decode_unicode_wire),
             "empty_upstream": empty_upstream,
             "dify_event_counts": dict(self.event_counts),
             "dify_event_total": self.event_total,
@@ -633,34 +689,13 @@ def iter_sse_from_parts(
     for tu in tool_uses:
         tid = tu.get("id") or toolu_id()
         inp = tu["input"]
-        lines.append(
-            sse_event(
-                {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tid,
-                        "name": tu["name"],
-                        "input": {},
-                    },
-                }
-            )
-        )
+        lines.append(sse_event(build_tool_use_block_start(idx, tid, tu["name"])))
         partial = json.dumps(inp, ensure_ascii=False)
         for ofs in range(0, max(1, len(partial)), _INPUT_JSON_CHUNK):
             piece = partial[ofs : ofs + _INPUT_JSON_CHUNK]
             if not piece:
                 break
-            lines.append(
-                sse_event(
-                    {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "input_json_delta", "partial_json": piece},
-                    }
-                )
-            )
+            lines.append(sse_event(build_input_json_delta(piece, idx)))
         lines.append(sse_event(build_content_block_stop(idx)))
         idx += 1
 
@@ -709,6 +744,7 @@ async def dify_events_to_anthropic_sse(
     input_tokens_hint: int = 0,
     result_out: dict[str, Any] | None = None,
     on_final_parts=None,
+    decode_unicode_wire: bool = False,
 ) -> AsyncIterator[str]:
     """消费 Dify 事件流，产出 Anthropic SSE。
 
@@ -724,6 +760,18 @@ async def dify_events_to_anthropic_sse(
     text_open = False
     answer_streamed = 0
     accum = DifyStreamAccum(input_tokens_hint=input_tokens_hint)
+    reasoning_wire_decoder = UnicodeWireStreamDecoder() if decode_unicode_wire else None
+    answer_wire_decoder = UnicodeWireStreamDecoder() if decode_unicode_wire else None
+
+    def decode_reasoning_delta(piece: str, *, final: bool = False) -> str:
+        if reasoning_wire_decoder is None:
+            return piece or ""
+        return reasoning_wire_decoder.feed(piece or "", final=final)
+
+    def decode_answer_delta(piece: str, *, final: bool = False) -> str:
+        if answer_wire_decoder is None:
+            return piece or ""
+        return answer_wire_decoder.feed(piece or "", final=final)
 
     def ensure_message_start() -> list[str]:
         nonlocal msg_started
@@ -769,14 +817,18 @@ async def dify_events_to_anthropic_sse(
         unsent = accum.answer_buf[answer_streamed:]
         if not unsent:
             return out
-        out.extend(open_text())
-        out.append(sse_event(build_text_delta(unsent, text_index or 0)))
+        visible = decode_answer_delta(unsent)
         answer_streamed = len(accum.answer_buf)
+        if not visible:
+            return out
+        out.extend(open_text())
+        out.append(sse_event(build_text_delta(visible, text_index or 0)))
         return out
 
     # 工具模式状态
     tools_thinking_streamed = False
     tools_text_streamed_len = 0
+    tools_streamed_text = ""
     tools_locked = False
 
     if enable_tools:
@@ -785,7 +837,7 @@ async def dify_events_to_anthropic_sse(
 
     def flush_tools_text_speculative() -> list[str]:
         """未见标记时流式吐正文；见标记（或整包 JSON 起手）后只缓冲。"""
-        nonlocal tools_text_streamed_len, tools_locked
+        nonlocal tools_text_streamed_len, tools_streamed_text, tools_locked
         out: list[str] = []
         buf = accum.answer_buf
         if tools_locked:
@@ -797,17 +849,21 @@ async def dify_events_to_anthropic_sse(
         if cut >= 0:
             tools_locked = True
             unsent = buf[tools_text_streamed_len:cut]
-            if unsent:
+            visible = decode_answer_delta(unsent, final=True)
+            tools_text_streamed_len = cut
+            if visible:
                 out.extend(open_text())
-                out.append(sse_event(build_text_delta(unsent, text_index or 0)))
-                tools_text_streamed_len = cut
+                out.append(sse_event(build_text_delta(visible, text_index or 0)))
+                tools_streamed_text += visible
             return out
         safe_end = max(tools_text_streamed_len, len(buf) - _HOLD)
         unsent = buf[tools_text_streamed_len:safe_end]
-        if unsent:
+        visible = decode_answer_delta(unsent)
+        tools_text_streamed_len = safe_end
+        if visible:
             out.extend(open_text())
-            out.append(sse_event(build_text_delta(unsent, text_index or 0)))
-            tools_text_streamed_len = safe_end
+            out.append(sse_event(build_text_delta(visible, text_index or 0)))
+            tools_streamed_text += visible
         return out
 
     try:
@@ -817,18 +873,26 @@ async def dify_events_to_anthropic_sse(
                 break
             if enable_tools:
                 if r_delta:
-                    for line in open_thinking():
-                        yield line
-                    yield sse_event(build_thinking_delta(r_delta, thinking_index or 0))
-                    tools_thinking_streamed = True
+                    visible_reasoning = decode_reasoning_delta(r_delta)
+                    if visible_reasoning:
+                        for line in open_thinking():
+                            yield line
+                        yield sse_event(
+                            build_thinking_delta(visible_reasoning, thinking_index or 0)
+                        )
+                        tools_thinking_streamed = True
                 if a_delta or accum.answer_buf:
                     for line in flush_tools_text_speculative():
                         yield line
                 continue
             if r_delta:
-                for line in open_thinking():
-                    yield line
-                yield sse_event(build_thinking_delta(r_delta, thinking_index or 0))
+                visible_reasoning = decode_reasoning_delta(r_delta)
+                if visible_reasoning:
+                    for line in open_thinking():
+                        yield line
+                    yield sse_event(
+                        build_thinking_delta(visible_reasoning, thinking_index or 0)
+                    )
             if accum.saw_separate_reasoning and (
                 a_delta or answer_streamed < len(accum.answer_buf)
             ):
@@ -853,6 +917,14 @@ async def dify_events_to_anthropic_sse(
         )
         return
 
+    reasoning_tail = decode_reasoning_delta("", final=True)
+    if reasoning_tail:
+        for line in open_thinking():
+            yield line
+        yield sse_event(build_thinking_delta(reasoning_tail, thinking_index or 0))
+        if enable_tools:
+            tools_thinking_streamed = True
+
     # ── 工具模式收尾：收齐后统一拆块 ──
     if enable_tools:
         if thinking_open and thinking_index is not None:
@@ -860,7 +932,12 @@ async def dify_events_to_anthropic_sse(
             thinking_open = False
             next_index = max(next_index, (thinking_index or 0) + 1)
 
-        parts = accum.finalize_parts(enable_tools=True, input_tokens_hint=input_tokens_hint)
+        parts = accum.finalize_parts(
+            enable_tools=True,
+            input_tokens_hint=input_tokens_hint,
+            decode_unicode_wire=decode_unicode_wire,
+            on_conversation_id=on_conversation_id,
+        )
         final_text = parts.get("text") or ""
         tool_uses = parts.get("tool_uses") or []
 
@@ -868,20 +945,18 @@ async def dify_events_to_anthropic_sse(
         if tools_text_streamed_len > 0:
             # 前缀已直播：从净化后的正文补尾，绝不回切含隐藏标记的原始缓冲。
             if not tool_uses:
-                streamed_prefix = accum.answer_buf[:tools_text_streamed_len]
-                if final_text.startswith(streamed_prefix):
+                streamed_prefix = re.sub(r"\n{3,}", "\n\n", tools_streamed_text).strip()
+                if streamed_prefix and final_text.startswith(streamed_prefix):
                     emit_text = final_text[len(streamed_prefix) :]
-                else:
-                    trimmed_prefix = streamed_prefix.rstrip()
-                    if trimmed_prefix and final_text.startswith(trimmed_prefix):
-                        emit_text = final_text[len(trimmed_prefix) :]
+                elif not streamed_prefix:
+                    emit_text = final_text
             if text_open and text_index is not None:
                 if emit_text:
                     yield sse_event(build_text_delta(emit_text, text_index))
                 yield sse_event(build_content_block_stop(text_index))
                 text_open = False
                 next_index = max(next_index, (text_index or 0) + 1)
-            emit_text = ""
+                emit_text = ""
         else:
             emit_text = final_text
 
@@ -924,6 +999,9 @@ async def dify_events_to_anthropic_sse(
     # ── 非工具收尾 ──
     if not accum.saw_separate_reasoning and accum.answer_buf:
         think, body = split_think_and_text(accum.answer_buf)
+        if decode_unicode_wire:
+            think = decode_unicode_wire_text(think)
+            body = decode_unicode_wire_text(body)
         if think:
             for line in open_thinking():
                 yield line
@@ -938,7 +1016,19 @@ async def dify_events_to_anthropic_sse(
         for line in flush_answer_live():
             yield line
 
-    parts = accum.finalize_parts(enable_tools=False, input_tokens_hint=input_tokens_hint)
+    if accum.saw_separate_reasoning:
+        answer_tail = decode_answer_delta("", final=True)
+        if answer_tail:
+            for line in open_text():
+                yield line
+            yield sse_event(build_text_delta(answer_tail, text_index or 0))
+
+    parts = accum.finalize_parts(
+        enable_tools=False,
+        input_tokens_hint=input_tokens_hint,
+        decode_unicode_wire=decode_unicode_wire,
+        on_conversation_id=on_conversation_id,
+    )
     if parts.get("empty_upstream") and (parts.get("text") or "").strip():
         for line in open_text():
             yield line
@@ -980,6 +1070,7 @@ async def collect_dify_answer(
     on_conversation_id=None,
     enable_tools: bool = False,
     input_tokens_hint: int = 0,
+    decode_unicode_wire: bool = False,
 ) -> tuple[str, str, list[dict[str, Any]], dict[str, int], dict[str, Any]]:
     """非流收集；返回 (text, reasoning, tool_uses, usage, parts)。"""
     accum = DifyStreamAccum(input_tokens_hint=input_tokens_hint)
@@ -988,6 +1079,9 @@ async def collect_dify_answer(
         if kind == "error":
             raise RuntimeError(str(accum.error or "Dify stream error"))
     parts = accum.finalize_parts(
-        enable_tools=enable_tools, input_tokens_hint=input_tokens_hint
+        enable_tools=enable_tools,
+        input_tokens_hint=input_tokens_hint,
+        decode_unicode_wire=decode_unicode_wire,
+        on_conversation_id=on_conversation_id,
     )
     return parts["text"], parts["reasoning"], parts["tool_uses"], parts["usage"], parts

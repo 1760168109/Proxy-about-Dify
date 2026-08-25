@@ -483,3 +483,66 @@ def test_find_stream_cut():
     assert find_stream_cut("你好 [[tool_use]] x".lower()) == 3
     assert find_stream_cut("纯文本没有标记".lower()) == -1
     assert find_stream_cut("<tool_call> 早于 [[tool_use]]".lower()) == 0
+
+
+def test_protocol_marker_views_stay_in_sync_with_the_table():
+    """三处标记视图共享 _MARKER_PAIRS；残留正则的覆盖面须不小于表。
+
+    截停要早、残留检测要宽、草案定位要准——三者覆盖面本就不同，故不能机械同形。
+    本用例锁住的是「表里新增一个标记而某个视图漏掉」这种静默失配。
+    """
+    from tools import (
+        AFTER_SUCCESS_CLOSE,
+        AFTER_SUCCESS_OPEN,
+        CODE_FENCE,
+        RAW_CLOSE_PREFIX,
+        RAW_OPEN_PREFIX,
+        STREAM_CUT_MARKERS,
+        TOOL_MARKERS,
+        TOOLS_JSON_CLOSE,
+        TOOLS_JSON_OPEN,
+        has_protocol_residue,
+        terminal_draft_follows_tools,
+    )
+
+    # 残留检测：表中每个字面标记、以及带任意键名的 raw 块，都必须被认出
+    residue_cases = [marker for pair in TOOL_MARKERS for marker in pair]
+    residue_cases += [
+        AFTER_SUCCESS_OPEN,
+        AFTER_SUCCESS_CLOSE,
+        TOOLS_JSON_OPEN,
+        TOOLS_JSON_CLOSE,
+        RAW_OPEN_PREFIX + "content]]",
+        RAW_CLOSE_PREFIX + "content]]",
+        RAW_OPEN_PREFIX + "new_string]]",
+    ]
+    for marker in residue_cases:
+        assert has_protocol_residue("正文 {} 尾".format(marker)), marker
+    assert not has_protocol_residue("纯正文，没有任何协议标记。")
+
+    # 截停视图：每个开标记与代码围栏都要能触发，闭标记不单独触发
+    for open_marker, _close in TOOL_MARKERS:
+        assert open_marker in STREAM_CUT_MARKERS
+    assert AFTER_SUCCESS_OPEN in STREAM_CUT_MARKERS
+    assert TOOLS_JSON_OPEN in STREAM_CUT_MARKERS
+    assert CODE_FENCE in STREAM_CUT_MARKERS
+    assert AFTER_SUCCESS_CLOSE not in STREAM_CUT_MARKERS
+
+    # 草案定位视图：草案之后出现任一协议标记即失格；after_success 自身不算
+    for marker in (
+        TOOL_MARKERS[0][0],
+        TOOL_MARKERS[0][1],
+        RAW_OPEN_PREFIX + "content]]",
+        TOOLS_JSON_OPEN,
+    ):
+        assert not terminal_draft_follows_tools(
+            "{}草案{}\n{}".format(AFTER_SUCCESS_OPEN, AFTER_SUCCESS_CLOSE, marker)
+        ), marker
+    assert terminal_draft_follows_tools(
+        "{}\n{{}}\n{}\n{}草案{}".format(
+            TOOL_MARKERS[0][0],
+            TOOL_MARKERS[0][1],
+            AFTER_SUCCESS_OPEN,
+            AFTER_SUCCESS_CLOSE,
+        )
+    )

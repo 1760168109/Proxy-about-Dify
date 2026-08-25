@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import threading
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from parse import text_from_content
-from persist import atomic_write_json, utc_now
+from persist import atomic_write_json, read_json_dict, utc_now
 from tools import TERMINAL_TOOL_NAMES, is_terminal_tool_batch
 
 
@@ -119,6 +120,39 @@ def _entry_epoch(entry: Any) -> float:
     return value if math.isfinite(value) else 0.0
 
 
+def _result_fingerprint(results: dict[str, dict[str, Any]]) -> str:
+    """只对当前 tool_result 的完整事实做幂等键，不保存正文到持久状态。"""
+    raw = json.dumps(
+        results,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+@dataclass(frozen=True)
+class TerminalRegistration:
+    """register 的结果。`__bool__` 与旧 bool 返回同义，故既有调用面不变。"""
+
+    ok: bool
+    reason: str
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+# 登记的拒绝原因在此命名：register 自己知道它为何拒绝，main 只能猜。
+# 架构.md 列举的登记失败情形若在日志里不可区分，「为何回上游」就无从排查（守则 17）。
+REG_OK = "registered"
+REG_NO_SESSION = "missing_user_or_cc_session"
+REG_EMPTY_DRAFT = "empty_after_success_draft"
+REG_NO_TOOLS = "empty_tool_batch"
+REG_INELIGIBLE_BATCH = "ineligible_or_conflicting_tool_batch"
+REG_BAD_TOOL_SHAPE = "tool_missing_id_or_duplicate_or_not_write_edit"
+
+
 class TerminalStore:
     """JSON 落盘：每个 user/session 至多一个待决终结批次。"""
 
@@ -135,20 +169,15 @@ class TerminalStore:
         self.max_entries = max(1, int(max_entries))
         self.clock = clock
         self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self._write(self._empty())
 
     @staticmethod
     def _empty() -> dict[str, Any]:
-        return {"users": {}}
+        return {"users": {}, "replays": {}}
 
     def _read(self) -> dict[str, Any]:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else self._empty()
-        except (OSError, json.JSONDecodeError):
-            return self._empty()
+        return read_json_dict(self.path, self._empty)
 
     def _write(self, data: dict[str, Any]) -> None:
         atomic_write_json(self.path, data)
@@ -158,7 +187,7 @@ class TerminalStore:
         users = data.get("users")
         if not isinstance(users, dict):
             data["users"] = {}
-            return True
+            users = data["users"]
         cutoff = self.clock() - self.ttl_seconds
         all_entries: list[tuple[float, str, str]] = []
         for user, bucket in list(users.items()):
@@ -176,16 +205,57 @@ class TerminalStore:
             if not bucket:
                 del users[user]
                 changed = True
-        if len(all_entries) <= self.max_entries:
-            return changed
-        all_entries.sort()
-        for _created, user, sid in all_entries[: len(all_entries) - self.max_entries]:
-            bucket = users.get(user)
-            if isinstance(bucket, dict):
-                bucket.pop(sid, None)
+        if len(all_entries) > self.max_entries:
+            all_entries.sort()
+            for _created, user, sid in all_entries[: len(all_entries) - self.max_entries]:
+                bucket = users.get(user)
+                if isinstance(bucket, dict):
+                    bucket.pop(sid, None)
+                    changed = True
+                    if not bucket:
+                        users.pop(user, None)
+
+        replays = data.get("replays")
+        if not isinstance(replays, dict):
+            data["replays"] = {}
+            replays = data["replays"]
+            changed = True
+        replay_entries: list[tuple[float, str, str, str]] = []
+        for user, sessions in list(replays.items()):
+            if not isinstance(sessions, dict):
+                del replays[user]
                 changed = True
+                continue
+            for sid, bucket in list(sessions.items()):
+                if not isinstance(bucket, dict):
+                    del sessions[sid]
+                    changed = True
+                    continue
+                for fp, entry in list(bucket.items()):
+                    created = _entry_epoch(entry)
+                    if created < cutoff:
+                        del bucket[fp]
+                        changed = True
+                    else:
+                        replay_entries.append((created, str(user), str(sid), str(fp)))
                 if not bucket:
-                    users.pop(user, None)
+                    del sessions[sid]
+                    changed = True
+            if not sessions:
+                del replays[user]
+                changed = True
+        if len(replay_entries) > self.max_entries:
+            replay_entries.sort()
+            for _created, user, sid, fp in replay_entries[: len(replay_entries) - self.max_entries]:
+                sessions = replays.get(user)
+                bucket = sessions.get(sid) if isinstance(sessions, dict) else None
+                if isinstance(bucket, dict):
+                    bucket.pop(fp, None)
+                    changed = True
+                    if not bucket:
+                        sessions.pop(sid, None)
+                    if not sessions:
+                        replays.pop(user, None)
         return changed
 
     def register(
@@ -194,27 +264,37 @@ class TerminalStore:
         session_id: str | None,
         tool_uses: list[dict[str, Any]],
         after_success: str,
-    ) -> bool:
+    ) -> TerminalRegistration:
         sid = (session_id or "").strip()
         text = (after_success or "").strip()
-        if not user or not sid or not text or not tool_uses:
-            return False
+        if not user or not sid:
+            return TerminalRegistration(False, REG_NO_SESSION)
+        if not text:
+            return TerminalRegistration(False, REG_EMPTY_DRAFT)
+        if not tool_uses:
+            return TerminalRegistration(False, REG_NO_TOOLS)
         if not is_terminal_tool_batch(tool_uses):
-            return False
+            return TerminalRegistration(False, REG_INELIGIBLE_BATCH)
         tools: dict[str, str] = {}
         for tool in tool_uses:
             if not isinstance(tool, dict):
-                return False
+                return TerminalRegistration(False, REG_BAD_TOOL_SHAPE)
             tid = str(tool.get("id") or "").strip()
             name = str(tool.get("name") or "").strip()
             if not tid or tid in tools or name not in TERMINAL_TOOL_NAMES:
-                return False
+                return TerminalRegistration(False, REG_BAD_TOOL_SHAPE)
             tools[tid] = name
         with self._lock:
             data = self._read()
             self._prune(data)
             users = data.setdefault("users", {})
             bucket = users.setdefault(user, {})
+            replays = data.setdefault("replays", {})
+            replay_sessions = replays.get(user)
+            if isinstance(replay_sessions, dict):
+                replay_sessions.pop(sid, None)
+                if not replay_sessions:
+                    replays.pop(user, None)
             bucket[sid] = {
                 "after_success": text[:8000],
                 "tools": tools,
@@ -223,7 +303,7 @@ class TerminalStore:
             }
             self._prune(data)
             self._write(data)
-        return True
+        return TerminalRegistration(True, REG_OK)
 
     def resolve(
         self, user: str, session_id: str | None, body: dict[str, Any]
@@ -235,10 +315,25 @@ class TerminalStore:
         if batch is None:
             return TerminalResolution()
         results, mixed = batch
+        fingerprint = "" if mixed else _result_fingerprint(results)
 
         with self._lock:
             data = self._read()
             pruned = self._prune(data)
+            replays = data.get("replays") if isinstance(data.get("replays"), dict) else {}
+            replay_sessions = replays.get(user) if isinstance(replays.get(user), dict) else {}
+            replay = replay_sessions.get(sid) if isinstance(replay_sessions, dict) else None
+            if fingerprint and isinstance(replay, dict) and fingerprint in replay:
+                replay_entry = replay[fingerprint]
+                if pruned:
+                    self._write(data)
+                return TerminalResolution(
+                    "success",
+                    text=str(replay_entry.get("after_success") or "").strip(),
+                    reason="all_terminal_tools_succeeded_replay",
+                    tool_ids=tuple(str(x) for x in replay_entry.get("tool_ids") or ()),
+                    tool_names=tuple(str(x) for x in replay_entry.get("tool_names") or ()),
+                )
             users = data.get("users") if isinstance(data.get("users"), dict) else {}
             bucket = users.get(user) if isinstance(users.get(user), dict) else {}
             entry = bucket.get(sid) if isinstance(bucket, dict) else None
@@ -254,43 +349,64 @@ class TerminalStore:
                     self._write(data)
                 return TerminalResolution()
 
-            # 已等到相关结果，本批无论成功或回退都只消费一次。
-            bucket.pop(sid, None)
-            if not bucket:
-                users.pop(user, None)
-            self._write(data)
-
             ids = tuple(sorted(expected))
             names = tuple(str(tools[tid]) for tid in ids)
+            resolution: TerminalResolution
             if mixed:
-                return TerminalResolution(
+                resolution = TerminalResolution(
                     "fallback",
                     reason="mixed_current_user",
                     tool_ids=ids,
                     tool_names=names,
                 )
-            if actual != expected:
-                return TerminalResolution(
+            elif actual != expected:
+                resolution = TerminalResolution(
                     "fallback",
                     reason="tool_result_set_mismatch",
                     tool_ids=ids,
                     tool_names=names,
                 )
-            for tid in ids:
-                if not _result_succeeded(str(tools[tid]), results[tid]):
-                    return TerminalResolution(
+            else:
+                failed_tid = next(
+                    (
+                        tid
+                        for tid in ids
+                        if not _result_succeeded(str(tools[tid]), results[tid])
+                    ),
+                    None,
+                )
+                if failed_tid is not None:
+                    resolution = TerminalResolution(
                         "fallback",
-                        reason="tool_result_not_explicit_success:{}".format(tid),
+                        reason="tool_result_not_explicit_success:{}".format(failed_tid),
                         tool_ids=ids,
                         tool_names=names,
                     )
-            return TerminalResolution(
-                "success",
-                text=str(entry.get("after_success") or "").strip(),
-                reason="all_terminal_tools_succeeded",
-                tool_ids=ids,
-                tool_names=names,
-            )
+                else:
+                    resolution = TerminalResolution(
+                        "success",
+                        text=str(entry.get("after_success") or "").strip(),
+                        reason="all_terminal_tools_succeeded",
+                        tool_ids=ids,
+                        tool_names=names,
+                    )
+
+            # 已等到相关结果，本批无论成功或回退都只消费一次；成功保留短期回放。
+            bucket.pop(sid, None)
+            if not bucket:
+                users.pop(user, None)
+            if resolution.status == "success":
+                replay_sessions = data.setdefault("replays", {}).setdefault(user, {})
+                replay_bucket = replay_sessions.setdefault(sid, {})
+                replay_bucket[fingerprint] = {
+                    "after_success": resolution.text[:8000],
+                    "tool_ids": list(ids),
+                    "tool_names": list(names),
+                    "created_at": utc_now(),
+                    "created_epoch": self.clock(),
+                }
+            self._write(data)
+            return resolution
 
     def clear_session(self, user: str, session_id: str) -> int:
         sid = (session_id or "").strip()
@@ -307,18 +423,31 @@ class TerminalStore:
         with self._lock:
             data = self._read()
             users = data.get("users") if isinstance(data.get("users"), dict) else {}
+            replays = data.get("replays") if isinstance(data.get("replays"), dict) else {}
             bucket = users.get(user) if isinstance(users.get(user), dict) else None
-            if not isinstance(bucket, dict):
+            replay_sessions = replays.get(user) if isinstance(replays.get(user), dict) else None
+            if not isinstance(bucket, dict) and not isinstance(replay_sessions, dict):
                 return 0
+            replay_removed = False
             if sid:
-                removed = 1 if sid in bucket else 0
-                bucket.pop(sid, None)
+                removed = 1 if isinstance(bucket, dict) and sid in bucket else 0
+                if isinstance(bucket, dict):
+                    bucket.pop(sid, None)
+                if isinstance(replay_sessions, dict):
+                    replay_removed = sid in replay_sessions
+                    replay_sessions.pop(sid, None)
             else:
-                removed = len(bucket)
-                bucket.clear()
-            if not bucket:
+                removed = len(bucket) if isinstance(bucket, dict) else 0
+                if isinstance(bucket, dict):
+                    bucket.clear()
+                if isinstance(replay_sessions, dict):
+                    replay_removed = bool(replay_sessions)
+                    replay_sessions.clear()
+            if isinstance(bucket, dict) and not bucket:
                 users.pop(user, None)
-            if removed:
+            if isinstance(replay_sessions, dict) and not replay_sessions:
+                replays.pop(user, None)
+            if removed or replay_removed:
                 self._write(data)
             return removed
 

@@ -5,7 +5,54 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from terminal import TerminalStore
+from terminal import (
+    REG_BAD_TOOL_SHAPE,
+    REG_EMPTY_DRAFT,
+    REG_INELIGIBLE_BATCH,
+    REG_NO_SESSION,
+    REG_NO_TOOLS,
+    REG_OK,
+    TerminalStore,
+)
+
+
+def test_register_rejection_reasons_are_distinguishable(tmp_path: Path):
+    """五种登记失败各有其名，且一律不落盘。
+
+    原因由 register 自己命名——它知道为何拒绝，调用方只能猜。架构.md 列举的登记
+    失败情形若在日志里压成同一句，「为何回上游」就无从排查（守则 17）。
+    """
+    store = TerminalStore(tmp_path / "terminal.json")
+    draft = "已写入。"
+
+    assert store.register("u", None, [_tool("w1")], draft).reason == REG_NO_SESSION
+    assert store.register("", "s1", [_tool("w1")], draft).reason == REG_NO_SESSION
+    assert store.register("u", "s1", [_tool("w1")], "   ").reason == REG_EMPTY_DRAFT
+    assert store.register("u", "s1", [], draft).reason == REG_NO_TOOLS
+    # Read 不是终结工具
+    assert (
+        store.register("u", "s1", [_tool("r1", name="Read")], draft).reason
+        == REG_INELIGIBLE_BATCH
+    )
+    # 同一文件的两次变更（大小写与斜杠不同也算同一目标）
+    assert (
+        store.register(
+            "u",
+            "s1",
+            [_tool("w1", path="C:\\same.md"), _tool("w2", path="c:/same.md")],
+            draft,
+        ).reason
+        == REG_INELIGIBLE_BATCH
+    )
+    no_id = _tool("w1")
+    no_id["id"] = ""
+    assert store.register("u", "s1", [no_id], draft).reason == REG_BAD_TOOL_SHAPE
+
+    assert store.pending_count("u") == 0
+
+    accepted = store.register("u", "s1", [_tool("w1")], draft)
+    assert accepted and accepted.reason == REG_OK
+    assert store.pending_count("u") == 1
 
 
 def _tool(tid: str, name: str = "Write", path: str | None = None) -> dict:
@@ -47,6 +94,24 @@ def test_terminal_write_persists_and_resolves_once(tmp_path: Path):
     assert resolution.tool_names == ("Write",)
     assert reloaded.pending_count("u") == 0
     assert reloaded.resolve("u", "s1", _body(_result("w1", "File created successfully"))).status == "none"
+
+
+def test_terminal_success_replays_same_result_without_pending_entry(tmp_path: Path):
+    store = TerminalStore(tmp_path / "terminal.json")
+    assert store.register("u", "s1", [_tool("w1")], "完成。")
+    body = _body(_result("w1", "File created successfully"))
+    assert store.resolve("u", "s1", body).status == "success"
+    replay = store.resolve("u", "s1", body)
+    assert replay.status == "success"
+    assert replay.reason.endswith("_replay")
+    assert (
+        store.resolve(
+            "u",
+            "s1",
+            _body(_result("w1", "File created successfully"), mixed_text="解释一下"),
+        ).status
+        == "none"
+    )
 
 
 def test_terminal_multiple_tools_require_exact_explicit_success(tmp_path: Path):

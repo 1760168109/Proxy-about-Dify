@@ -4,7 +4,10 @@
 route（haiku/opus/local）· kind（chat/title/recap/compact/placeholder）·
 tools · 续主会话 · inputs 物化档 · 结构化出口 · 出站流式形态。
 
-优先级：旁路（title/recap/compact）→ 子代理 → testandlife → model 名 → 默认 opus。
+优先级：占位模板 → 旁路（title/recap/compact）→ 子代理 → testandlife → model 名 → 默认 opus。
+
+模型档（route）与枪型（kind）是两件事：compact 走 opus 换压缩质量，但 inputs 物化档、
+query 载体与「不续主会话指针」仍由枪型决定，不得改由模型档推导。
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from parse import strip_reminders, system_to_text, text_from_content
+from protocol import DEFAULT_MODEL, MODEL_ALIASES
 
 Route = Literal["haiku", "opus", "local"]
 GunKind = Literal["placeholder", "title", "recap", "compact", "chat"]
@@ -21,10 +25,6 @@ QueryMode = Literal["title_fold", "history_current", "opus_continue"]
 # query 首行标记，供岚 if-else「包含」匹配；改动须同步岚工作流
 ROUTE_TAG_HAIKU = "[[cc_route:haiku]]"
 ROUTE_TAG_OPUS = "[[cc_route:opus]]"
-
-# 代理认领的模型别名（路由判定与 /v1/models 发现共用）
-MODEL_ALIASES = ("alan", "dify-lan", "lan", "岚")
-DEFAULT_MODEL = "dify-lan"
 
 SIDECAR_KINDS = ("title", "recap", "compact")
 
@@ -36,7 +36,6 @@ SMOKE_HAIKU_TOKEN = "testandlife"
 _TITLE_MARKERS = (
     "Generate a concise, sentence-case title",
     'single "title" field',
-    "single \"title\" field",
     "Return JSON with a single",
 )
 _RECAP_MARKERS = (
@@ -109,10 +108,9 @@ class Plan:
 
     model: str
     stream: bool
-    route: str
+    route: Route
     route_tag: str
     route_reasons: list[str] = field(default_factory=list)
-    cc_model: str = ""
     is_subagent: bool = False
     kind: GunKind = "chat"
     trim_mode: str | None = None
@@ -136,10 +134,10 @@ class Plan:
 
     def log_extra(self) -> dict[str, Any]:
         return {
+            "model": self.model,
             "route": self.route,
             "route_tag": self.route_tag,
             "route_reasons": list(self.route_reasons),
-            "cc_model": self.cc_model,
             "stream": self.stream,
             "is_subagent": self.is_subagent,
             "gun_kind": self.kind,
@@ -162,31 +160,18 @@ def _last_user_text(body: dict[str, Any]) -> str:
     return ""
 
 
-def _request_blob(body: dict[str, Any]) -> str:
-    parts = [system_to_text(body.get("system"))]
-    for m in body.get("messages") or []:
-        if isinstance(m, dict):
-            parts.append(text_from_content(m.get("content")))
-    return "\n".join(parts)
+def is_title_generation(system_text: str, last_user: str) -> bool:
+    return any(m in system_text for m in _TITLE_MARKERS) or any(
+        m in last_user for m in _TITLE_MARKERS
+    )
 
 
-def is_title_generation(body: dict[str, Any]) -> bool:
-    system = system_to_text(body.get("system"))
-    if any(m in system for m in _TITLE_MARKERS):
-        return True
-    return any(m in _request_blob(body) for m in _TITLE_MARKERS)
-
-
-def is_recap_generation(body: dict[str, Any]) -> bool:
-    last_user = _last_user_text(body)
-    if any(m in last_user for m in _RECAP_MARKERS):
-        return True
-    blob = system_to_text(body.get("system")) + "\n" + last_user
+def is_recap_generation(system_text: str, last_user: str) -> bool:
+    blob = system_text + "\n" + last_user
     return any(m in blob for m in _RECAP_MARKERS)
 
 
-def is_compact_generation(body: dict[str, Any]) -> bool:
-    last_user = _last_user_text(body)
+def is_compact_generation(last_user: str) -> bool:
     if not last_user:
         return False
     # 多特征命中，防正文偶含 "Primary Request" 误触
@@ -199,9 +184,9 @@ def is_compact_generation(body: dict[str, Any]) -> bool:
     )
 
 
-def is_placeholder_agent_task(body: dict[str, Any]) -> bool:
+def is_placeholder_agent_task(last_user: str) -> bool:
     """CC 子代理偶发把未填占位模板（sys/hist/msg）当任务发来 → 本地短路。"""
-    core = strip_reminders(_last_user_text(body)).strip()
+    core = strip_reminders(last_user).strip()
     if _PLACEHOLDER_AGENT_TASK_RE.match(core):
         return True
     return (
@@ -212,12 +197,11 @@ def is_placeholder_agent_task(body: dict[str, Any]) -> bool:
     )
 
 
-def is_subagent_session(body: dict[str, Any]) -> bool:
+def is_subagent_session(body: dict[str, Any], system_text: str) -> bool:
     """Agent 工具拉起的子代理会话（多信号打分，降低文案微调漏判）。"""
-    system = system_to_text(body.get("system"))
-    if not system:
+    if not system_text:
         return False
-    head = system.lstrip()[:1200]
+    head = system_text.lstrip()[:1200]
 
     if head.startswith("You are Claude Code"):
         return False
@@ -228,7 +212,7 @@ def is_subagent_session(body: dict[str, Any]) -> bool:
         return True
 
     score = 0
-    if any(m in system for m in _SUBAGENT_AUX_MARKERS):
+    if any(m in system_text for m in _SUBAGENT_AUX_MARKERS):
         score += 2
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
@@ -298,45 +282,68 @@ def build_plan(
         model = DEFAULT_MODEL
     stream = bool(body.get("stream")) if "stream" in body else bool(accept_sse)
 
-    is_title = is_title_generation(body)
-    is_recap = is_recap_generation(body)
-    is_compact = is_compact_generation(body)
+    # 一次扫 body：system 与末条 user 各摊平一次，供下面全部检测器复用。
+    # text_from_content 对含完整文件正文的 tool_result 会构造整份字符串副本，
+    # 原先五个检测器各自摊平一遍，与本模块「一次扫 body」的声明相违。
+    # 控制信号只取当前请求壳与末条 user，不追溯历史正文。
+    system_text = system_to_text(body.get("system"))
+    last_user = _last_user_text(body)
+    blob_low = (system_text + "\n" + last_user).lower()
 
-    if is_placeholder_agent_task(body):
+    is_title = is_title_generation(system_text, last_user)
+    is_recap = is_recap_generation(system_text, last_user)
+    is_compact = is_compact_generation(last_user)
+
+    if is_placeholder_agent_task(last_user):
         return Plan(
             model=model,
             stream=stream,
             route="local",
             route_tag="",
             route_reasons=["placeholder_agent_task"],
-            cc_model=model,
             kind="placeholder",
             is_main_window=False,
         )
 
     mlow = model.strip().lower()
     reasons: list[str] = []
-    subagent = is_subagent_session(body)
-    blob_low = ""
+    subagent = is_subagent_session(body, system_text)
 
-    if is_title or is_recap or is_compact or any(
-        m.lower() in (blob_low := _request_blob(body).lower())
-        for m in _SIDECAR_EXTRA_MARKERS
-    ):
-        route = "haiku"
-        reasons.append("sidecar_fast_task")
-        if is_compact:
-            reasons.append("compact_job")
-        elif is_recap:
+    # 指纹漏判的兜底与真 compact 同档：兜底若只改 route 会产出策略不自洽的第四类枪。
+    is_compact_like = is_compact or any(
+        m.lower() in blob_low for m in _SIDECAR_EXTRA_MARKERS
+    )
+
+    # 枪型先定，模型档与日志理由一律由它推出。route 与 kind 各自判一次优先级会产出
+    # kind=title + route=opus 这类不自洽组合——按 title 折叠，却按 opus 单价计费。
+    if is_title:
+        kind: GunKind = "title"
+    elif is_compact_like:
+        kind = "compact"
+    elif is_recap:
+        kind = "recap"
+    else:
+        kind = "chat"
+    is_sidecar = kind in SIDECAR_KINDS
+
+    if is_sidecar:
+        # 压缩有损，压坏则后续全程受影响，故独走 opus 换质量；
+        # title / recap 只需短产出，留在快档省额度。
+        route = "opus" if kind == "compact" else "haiku"
+        reasons.append("sidecar_summary_task")
+        if kind == "compact":
+            reasons.append("compact_job" if is_compact else "compact_marker_job")
+        elif kind == "recap":
             reasons.append("recap_job")
-        elif is_title:
-            reasons.append("title_job")
         else:
-            reasons.append("sidecar_extra_marker")
+            reasons.append("title_job")
+            if is_compact_like:
+                # 两套指纹交叉命中，kind 以 title 为准；留证以便按守则 10 对指纹
+                reasons.append("compact_marker_overridden")
     elif subagent:
         route, sub_reasons = _classify_subagent_route(body)
         reasons.extend(sub_reasons)
-    elif SMOKE_HAIKU_TOKEN in (blob_low or _request_blob(body).lower()):
+    elif SMOKE_HAIKU_TOKEN in blob_low:
         route = "haiku"
         reasons.append("smoke_token_testandlife")
     elif "haiku" in mlow:
@@ -352,19 +359,13 @@ def build_plan(
         route = "opus"
         reasons.append("default_opus")
 
-    if is_title:
-        kind: GunKind = "title"
-    elif is_compact:
-        kind = "compact"
-    elif is_recap:
-        kind = "recap"
+    # 物化档看枪型：旁路恒全键写空串清掉上轮会话变量，其余 haiku 枪只丢解析键。
+    if is_sidecar:
+        trim_mode: str | None = "empty"
+    elif route == "haiku":
+        trim_mode = "strip"
     else:
-        kind = "chat"
-    is_sidecar = kind in SIDECAR_KINDS
-
-    trim_mode = None
-    if route == "haiku":
-        trim_mode = "empty" if is_sidecar else "strip"
+        trim_mode = None
 
     enable_tools = (
         isinstance(body.get("tools"), list)
@@ -372,9 +373,10 @@ def build_plan(
         and not is_sidecar
     )
 
-    if route == "haiku" and is_title:
+    # 旁路枪 inputs 已全清，历史只能折叠进 query；与走哪个模型档无关。
+    if is_title:
         query_mode: QueryMode = "title_fold"
-    elif route == "haiku":
+    elif is_sidecar or route == "haiku":
         query_mode = "history_current"
     else:
         query_mode = "opus_continue"
@@ -385,12 +387,12 @@ def build_plan(
         route=route,
         route_tag=ROUTE_TAG_HAIKU if route == "haiku" else ROUTE_TAG_OPUS,
         route_reasons=reasons,
-        cc_model=model,
         is_subagent=subagent,
         kind=kind,
         trim_mode=trim_mode,
         enable_tools=enable_tools,
-        attach_main=(route == "opus" and not subagent),
+        # 守则 4：旁路摘要即使走 opus 也不得续主会话指针。
+        attach_main=(route == "opus" and not subagent and not is_sidecar),
         tool_structured=bool(tool_structured and enable_tools and route == "opus"),
         query_mode=query_mode,
         is_main_window=(not subagent) and (not is_sidecar),

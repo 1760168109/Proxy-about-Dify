@@ -12,8 +12,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from parse import TOOL_RESULT_PREFIX, text_from_content
-from persist import atomic_write_json
+from parse import (
+    TOOL_RESULT_PREFIX,
+    normalize_path,
+    path_from_tool_input,
+    text_from_content,
+)
+from persist import atomic_write_json, read_json_dict
 
 _WASTED_MARKERS = (
     "Wasted call",
@@ -90,44 +95,6 @@ def _is_context_placeholder(text: str | None) -> bool:
     return any(t.startswith(prefix) for prefix in _CONTEXT_PLACEHOLDER_PREFIXES)
 
 
-def normalize_path(path: str) -> str:
-    """跨平台可比的路径键。"""
-    p = (path or "").strip().strip('"').strip("'")
-    if not p:
-        return ""
-    if p.startswith("@"):
-        p = p[1:]
-    p = p.replace("/", "\\")
-    if p.startswith("\\\\"):
-        p = "\\\\" + re.sub(r"\\+", r"\\", p[2:])
-    else:
-        p = re.sub(r"\\+", r"\\", p)
-    return p.casefold()
-
-
-def _path_from_input(raw: Any) -> str:
-    if raw is None:
-        return ""
-    if isinstance(raw, dict):
-        for k in ("file_path", "path", "filePath", "filename"):
-            v = raw.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return ""
-    if isinstance(raw, str):
-        s = raw.strip()
-        try:
-            obj = json.loads(s)
-            if isinstance(obj, dict):
-                return _path_from_input(obj)
-        except Exception:
-            pass
-        m = re.search(r'file_path["\']?\s*[:=]\s*["\']([^"\']+)["\']', s, re.I)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
 class ReadCache:
     """JSON 落盘：{ users: { user_id: { norm_path: {path, content, chars, updated_at} } } }"""
 
@@ -148,15 +115,7 @@ class ReadCache:
     def _load(self) -> dict[str, Any]:
         if self._data is not None:
             return self._data
-        if self.store_path.is_file():
-            try:
-                obj = json.loads(self.store_path.read_text(encoding="utf-8"))
-                if isinstance(obj, dict):
-                    self._data = obj
-                    return self._data
-            except Exception:
-                pass
-        self._data = {"users": {}}
+        self._data = read_json_dict(self.store_path, lambda: {"users": {}})
         return self._data
 
     def _save(self) -> None:
@@ -165,11 +124,18 @@ class ReadCache:
     def put(self, user_id: str, path: str, content: str) -> bool:
         if not user_id or not path:
             return False
-        text = (content or "").strip()
-        if len(text) < self.min_chars or is_wasted_call(text) or _is_context_placeholder(text):
+        text = content if isinstance(content, str) else str(content or "")
+        if (
+            len(text) < self.min_chars
+            or not text.strip()
+            or is_wasted_call(text)
+            or _is_context_placeholder(text)
+        ):
             return False
         if len(text) > self.max_chars_per_entry:
-            text = text[: self.max_chars_per_entry]
+            # 守则 15：宁可下一枪重读，也不回放砍尾正文——重放前缀不带「已截断」标记，
+            # 模型会把残缺文件当作完整状态。超限即拒绝入缓存。
+            return False
         key = normalize_path(path)
         if not key:
             return False
@@ -190,6 +156,34 @@ class ReadCache:
             data["users"][user_id] = dict(ordered[: self.max_entries_per_user])
         self._save()
         return True
+
+    def has_mutation(self, user_id: str, path: str, mutation_id: str) -> bool:
+        """判断某个 tool_use 是否已作用于当前缓存快照。"""
+        if not user_id or not path or not mutation_id:
+            return False
+        key = normalize_path(path)
+        ent = ((self._load().get("users") or {}).get(user_id) or {}).get(key)
+        applied = ent.get("applied_mutations") if isinstance(ent, dict) else None
+        return isinstance(applied, list) and mutation_id in applied
+
+    def mark_mutation(self, user_id: str, path: str, mutation_id: str) -> None:
+        """在快照内保留有限的 mutation id，避免历史重扫重复 Edit/Write。"""
+        if not user_id or not path or not mutation_id:
+            return
+        key = normalize_path(path)
+        if not key:
+            return
+        data = self._load()
+        ent = ((data.get("users") or {}).get(user_id) or {}).get(key)
+        if not isinstance(ent, dict):
+            return
+        applied = ent.setdefault("applied_mutations", [])
+        if not isinstance(applied, list):
+            applied = ent["applied_mutations"] = []
+        if mutation_id not in applied:
+            applied.append(mutation_id)
+            del applied[:-32]
+            self._save()
 
     def get(self, user_id: str, path: str) -> str | None:
         key = normalize_path(path)
@@ -224,7 +218,17 @@ def id_to_path_from_text(text: str) -> dict[str, str]:
         if (m.group(1) or "").strip().lower() != "read":
             continue
         tid = (m.group(2) or "").strip()
-        p = _path_from_input(m.group(3) or "")
+        raw_input = m.group(3) or ""
+        try:
+            parsed_input = json.loads(raw_input)
+        except Exception:
+            parsed_input = None
+        if isinstance(parsed_input, dict) and (
+            parsed_input.get("offset") is not None
+            or parsed_input.get("limit") is not None
+        ):
+            continue
+        p = path_from_tool_input(parsed_input if isinstance(parsed_input, dict) else raw_input)
         if tid and p:
             out[tid] = p
     return out
@@ -238,8 +242,8 @@ def _ingest_folded_tool_text(
     id_to_path.update(id_to_path_from_text(text))
     for m in _TOOL_RESULT_TEXT_RE.finditer(text):
         tid = (m.group(2) or "").strip()
-        body = (m.group(3) or "").strip()
-        if not body or is_wasted_call(body):
+        body = m.group(3) or ""
+        if not body.strip() or is_wasted_call(body):
             continue
         path = id_to_path.get(tid) or ""
         if path:
@@ -259,13 +263,13 @@ def _ingest_system_trace(text: str, cache: ReadCache, user_id: str) -> None:
             )
             if not m2:
                 continue
-            path = _path_from_input(m2.group(1))
+            path = path_from_tool_input(m2.group(1))
             rest = part[m2.end() :]
         else:
-            path = _path_from_input(m.group(1))
+            path = path_from_tool_input(m.group(1))
             rest = part[m.end() :]
-        body = re.split(r"\nCalled the\s+", rest, maxsplit=1)[0].strip()
-        if path and body and not is_wasted_call(body):
+        body = re.split(r"\nCalled the\s+", rest, maxsplit=1)[0]
+        if path and body.strip() and not is_wasted_call(body):
             cache.put(user_id, path, body)
 
 
@@ -276,16 +280,26 @@ def _apply_cached_mutation(
     name: str,
     path: str,
     inp: dict[str, Any],
+    mutation_id: str = "",
 ) -> None:
     """成功 Write 更新快照；成功 Edit 能精确应用则更新，否则使旧快照失效。"""
     if not path:
         return
+    if mutation_id and cache.has_mutation(user_id, path, mutation_id):
+        return
+
+    def _mark() -> None:
+        cache.mark_mutation(user_id, path, mutation_id)
+
     n = (name or "").lower()
     if n == "write":
         content = inp.get("content")
+        # delete 不可省：put 在正文过短/为空/命中 wasted 时会拒绝写入，
+        # 少了前置 delete，编辑前的旧快照就留在缓存里并被重放。下同。
         cache.delete(user_id, path)
         if isinstance(content, str):
             cache.put(user_id, path, content)
+        _mark()
         return
     if n != "edit":
         return
@@ -295,16 +309,20 @@ def _apply_cached_mutation(
     current = cache.get(user_id, path)
     if not isinstance(old, str) or not isinstance(new, str) or not current:
         cache.delete(user_id, path)
+        _mark()
         return
     if old in current:
         updated = current.replace(old, new, -1 if inp.get("replace_all") else 1)
         cache.delete(user_id, path)
         cache.put(user_id, path, updated)
+        _mark()
         return
     # 同一历史会被每枪重扫；已应用过的 Edit 应保持幂等。
     if new and new in current:
+        _mark()
         return
     cache.delete(user_id, path)
+    _mark()
 
 
 def ingest_messages_into_cache(
@@ -345,10 +363,15 @@ def ingest_messages_into_cache(
                 tid = str(b.get("id") or "")
                 raw_inp = b.get("input")
                 inp = raw_inp if isinstance(raw_inp, dict) else {}
-                p = _path_from_input(inp)
+                p = path_from_tool_input(inp)
                 if tid:
                     tool_meta[tid] = (name, p, inp)
-                    if name.lower() == "read" and p:
+                    if (
+                        name.lower() == "read"
+                        and p
+                        and inp.get("offset") is None
+                        and inp.get("limit") is None
+                    ):
                         id_to_path[tid] = p
             elif btype == "tool_result":
                 tid = str(b.get("tool_use_id") or b.get("id") or "")
@@ -363,11 +386,23 @@ def ingest_messages_into_cache(
                 ):
                     continue
                 text = text_from_content(inner)
-                if name.lower() == "read" and path and text and not is_wasted_call(text):
+                if (
+                    name.lower() == "read"
+                    and path
+                    and inp.get("offset") is None
+                    and inp.get("limit") is None
+                    and text
+                    and not is_wasted_call(text)
+                ):
                     cache.put(user_id, path, text)
                 elif name.lower() in ("write", "edit"):
                     _apply_cached_mutation(
-                        cache, user_id, name=name, path=path, inp=inp
+                        cache,
+                        user_id,
+                        name=name,
+                        path=path,
+                        inp=inp,
+                        mutation_id=tid,
                     )
 
         blob = text_from_content(content)
@@ -472,15 +507,15 @@ def _has_path_hint(query_user: str) -> bool:
     )
 
 
-def _tool_body_has_substance(tool_invocation: str, min_chars: int) -> bool:
-    ti = (tool_invocation or "").strip()
-    if not ti:
+def _tool_body_has_substance(read_evidence: str, min_chars: int) -> bool:
+    ev = (read_evidence or "").strip()
+    if not ev:
         return False
-    if REHYDRATE_PREFIX.strip() in ti:
+    if REHYDRATE_PREFIX.strip() in ev:
         return True
 
-    if "Result of calling the Read tool" in ti:
-        for part in re.split(r"Result of calling the\s+Read\s+tool:\s*", ti, flags=re.I)[1:]:
+    if "Result of calling the Read tool" in ev:
+        for part in re.split(r"Result of calling the\s+Read\s+tool:\s*", ev, flags=re.I)[1:]:
             body = re.split(r"\nCalled the\s+", part, maxsplit=1)[0].strip()
             if (
                 len(body) >= min_chars
@@ -491,10 +526,10 @@ def _tool_body_has_substance(tool_invocation: str, min_chars: int) -> bool:
 
     read_ids = {
         (match.group(2) or "").strip()
-        for match in _TOOL_USE_TEXT_RE.finditer(ti)
+        for match in _TOOL_USE_TEXT_RE.finditer(ev)
         if (match.group(1) or "").strip().lower() == "read"
     }
-    for match in _TOOL_RESULT_TEXT_RE.finditer(ti):
+    for match in _TOOL_RESULT_TEXT_RE.finditer(ev):
         tool_use_id = (match.group(2) or "").strip()
         body = (match.group(3) or "").strip()
         if (
@@ -509,17 +544,22 @@ def _tool_body_has_substance(tool_invocation: str, min_chars: int) -> bool:
 
 def should_annotate_need_read(
     query_user: str,
-    tool_invocation: str,
+    read_evidence: str,
     *,
-    is_tool_continue: bool = False,
     min_chars: int = _MIN_CACHE_CHARS,
 ) -> bool:
-    """本轮像引用了文件、但上下文尚无实质正文 → 需要强制 Read 提示。"""
-    if is_tool_continue:
-        return False
+    """本轮像引用了文件、但上下文尚无实质正文 → 需要强制 Read 提示。
+
+    `read_evidence` 是 `Tool_invocation` 与 `Current_Context` 拼起来的证据串，不是
+    某一个 INPUT_KEYS 键。此参曾以键名 `tool_invocation` 命名，读码者据名断定
+    `Current_Context` 不参与本判定——形参名指向了比实参更窄的东西。
+
+    「是否工具续写」由 query_user 是否以 tool_result 前缀起头判定，就在下一行；
+    不再由调用方另算一遍同一表达式传进来。
+    """
     q = (query_user or "").strip()
     if not q or q.startswith(TOOL_RESULT_PREFIX):
         return False
     if not _has_path_hint(q):
         return False
-    return not _tool_body_has_substance(tool_invocation or "", min_chars)
+    return not _tool_body_has_substance(read_evidence or "", min_chars)

@@ -2,9 +2,19 @@
 """入站上下文纯化：工具正文单载体与文件状态折叠。"""
 from __future__ import annotations
 
+import json
+
 from outbound import prepare_text_outbound
-from parse import parse_payload
+from parse import build_history_and_current, parse_payload
 from plan import build_plan
+
+
+def _full_history(parsed: dict) -> str:
+    """旁路枪用的完整历史：与 prepare_text_outbound 同路折叠 parse 交出的原料。"""
+    history_full, _current, _notes = build_history_and_current(
+        parsed["conversation_messages"]
+    )
+    return history_full
 
 
 PATH = r"C:\work\note.md"
@@ -24,6 +34,19 @@ def _result(tid: str, content: str, *, is_error: bool = False) -> dict:
     if is_error:
         block["is_error"] = True
     return {"role": "user", "content": [block]}
+
+
+def _system_read_trace(path: str, content: str, **read_options) -> dict:
+    inp = {"file_path": path, **read_options}
+    return {
+        "role": "system",
+        "content": (
+            "Called the Read tool with the following input: "
+            + json.dumps(inp, ensure_ascii=False)
+            + "\nResult of calling the Read tool:\n"
+            + content
+        ),
+    }
 
 
 def _agent_call(tid: str, description: str = "调查项目结构") -> dict:
@@ -129,7 +152,7 @@ def test_prior_tool_result_body_moves_out_of_history():
     assert tools.count("PRIOR_RESULT_UNIQUE") == 1
     assert "PRIOR_RESULT_UNIQUE" not in history
     assert "body carried in Tool_invocation" in history
-    assert "PRIOR_RESULT_UNIQUE" in parsed["history_full"]
+    assert "PRIOR_RESULT_UNIQUE" in _full_history(parsed)
 
 
 def test_tool_result_before_trailing_assistant_is_historical():
@@ -166,6 +189,57 @@ def test_new_full_read_supersedes_old_file_snapshot():
     assert "OLD_FILE_SNAPSHOT" not in tools
     assert "superseded file state" in tools
     assert tools.count("NEW_FILE_SNAPSHOT") == 1
+
+
+def test_trailing_system_read_routes_to_current_context_and_supersedes_old_fragment():
+    body = {
+        "messages": [
+            {"role": "user", "content": "先读前 80 行"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "r1",
+                        "name": "Read",
+                        "input": {"file_path": PATH, "limit": 80},
+                    }
+                ],
+            },
+            _result("r1", "OLD_CH00_FIRST_80_LINES"),
+            {"role": "assistant", "content": "已读"},
+            {"role": "user", "content": "请通读 @note.md"},
+            _system_read_trace(PATH, "CURRENT_FULL_FILE_STATE"),
+        ]
+    }
+
+    parsed = parse_payload(body)
+    current = parsed["inputs"]["Current_Context"]
+    tools = parsed["inputs"]["Tool_invocation"]
+
+    assert "CURRENT_FULL_FILE_STATE" in current
+    assert "CURRENT_FULL_FILE_STATE" not in tools
+    assert "OLD_CH00_FIRST_80_LINES" not in tools
+    assert "latest=Current_Context" in tools
+    assert "current_context_full_reads=1" in parsed["notes"]
+
+
+def test_partial_trailing_system_read_does_not_supersede_historical_full_state():
+    body = {
+        "messages": [
+            {"role": "user", "content": "先读全文"},
+            _read("r1"),
+            _result("r1", "HISTORICAL_FULL_STATE"),
+            {"role": "assistant", "content": "已读"},
+            {"role": "user", "content": "再看开头"},
+            _system_read_trace(PATH, "CURRENT_PARTIAL_STATE", limit=80),
+        ]
+    }
+
+    parsed = parse_payload(body)
+    assert "CURRENT_PARTIAL_STATE" in parsed["inputs"]["Current_Context"]
+    assert "HISTORICAL_FULL_STATE" in parsed["inputs"]["Tool_invocation"]
+    assert "current_context_full_reads=0" in parsed["notes"]
 
 
 def test_successful_write_supersedes_read_but_keeps_new_content():
@@ -447,7 +521,7 @@ def test_legacy_user_agent_notification_is_promoted_out_of_user_query():
     assert [x["tool_use_id"] for x in _lifecycle(parsed, "result_ready")] == ["a1"]
     assert _lifecycle(parsed, "pending") == []
     assert "SYSTEM NOTIFICATION" not in parsed["query_user"]
-    assert "LEGACY_RESULT_UNIQUE" not in parsed.get("history_full", "")
+    assert "LEGACY_RESULT_UNIQUE" not in _full_history(parsed)
     assert parsed["inputs"]["System_Description"].count("LEGACY_RESULT_UNIQUE") == 1
 
 

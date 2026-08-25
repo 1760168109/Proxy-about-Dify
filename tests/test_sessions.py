@@ -122,6 +122,22 @@ def test_remember_without_sid_keeps_by_cc(tmp_path: Path):
     assert store.get_current("u1") == "cid2"
 
 
+def test_binding_epoch_rejects_stale_inflight_remember(tmp_path: Path):
+    store = _store(tmp_path)
+    resolved = store.resolve_conversation("u1", S1)
+    store.new_session("u1", clear_all=True)
+    assert (
+        store.remember(
+            "u1",
+            "stale-cid",
+            cc_session_id=S1,
+            expected_epoch=resolved["binding_epoch"],
+        )
+        is False
+    )
+    assert store.resolve_conversation("u1", S1)["session_bind"] == "miss"
+
+
 def test_lru_drops_oldest(tmp_path: Path):
     p = tmp_path / "sessions.json"
     sids = ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa{}".format(i) for i in range(3)]
@@ -157,5 +173,20 @@ def test_legacy_store_without_by_cc(tmp_path: Path):
     assert store.resolve_conversation("legacy-user", S1)["session_bind"] == "hit"
 
 
-def test_max_by_cc_constant():
-    assert MAX_BY_CC >= 1
+def test_default_max_by_cc_is_enforced(tmp_path: Path):
+    """默认上限也要被真正执行。
+
+    上面的 LRU 用例一律传显式 max_by_cc，故 MAX_BY_CC 被改成 0 或极大值都不会
+    有人发现——断言那个常量 `>= 1` 也不会，因为它除刻意改动外无从失败。
+    """
+    store = SessionStore(tmp_path / "sessions.json")  # 不传 max_by_cc，走默认
+    for i in range(MAX_BY_CC + 5):
+        store.remember(
+            "u1",
+            "cid-{}".format(i),
+            cc_session_id="dddddddd-dddd-4ddd-8ddd-{:012d}".format(i),
+        )
+
+    assert len(store.get_state("u1")["by_cc"]) == MAX_BY_CC
+    latest = "dddddddd-dddd-4ddd-8ddd-{:012d}".format(MAX_BY_CC + 4)
+    assert store.resolve_conversation("u1", latest)["session_bind"] == "hit"

@@ -9,8 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from cache import ReadCache
-from meter import UsageMeter
 from sessions import SessionStore
 from terminal import TerminalStore
 
@@ -66,15 +64,10 @@ def _tool_from_sse(text: str) -> dict:
 
 @pytest.mark.parametrize("first_stream", [False, True])
 def test_terminal_success_short_circuits_second_dify_call(
-    tmp_path: Path, monkeypatch, first_stream: bool
+    isolated_main, monkeypatch, first_stream: bool
 ):
     user = "terminal-test-user"
-    monkeypatch.setattr(main, "DIFY_USER_ID", user)
-    monkeypatch.setattr(main, "LOG_REQUESTS", False)
-    monkeypatch.setattr(main, "store", SessionStore(tmp_path / "sessions.json"))
-    monkeypatch.setattr(main, "meter", UsageMeter(tmp_path / "usage.json"))
-    monkeypatch.setattr(main, "read_cache", ReadCache(tmp_path / "cache.json", min_chars=1))
-    monkeypatch.setattr(main, "terminal_store", TerminalStore(tmp_path / "terminal.json"))
+    isolated_main(user=user, cache_min_chars=1)
 
     upstream_calls = []
 
@@ -160,15 +153,10 @@ def test_terminal_success_short_circuits_second_dify_call(
 
 
 def test_terminal_error_returns_to_dify_and_bills_continuation(
-    tmp_path: Path, monkeypatch
+    isolated_main, tmp_path: Path, monkeypatch
 ):
     user = "terminal-fallback-user"
-    monkeypatch.setattr(main, "DIFY_USER_ID", user)
-    monkeypatch.setattr(main, "LOG_REQUESTS", False)
-    monkeypatch.setattr(main, "store", SessionStore(tmp_path / "sessions.json"))
-    monkeypatch.setattr(main, "meter", UsageMeter(tmp_path / "usage.json"))
-    monkeypatch.setattr(main, "read_cache", ReadCache(tmp_path / "cache.json", min_chars=1))
-    monkeypatch.setattr(main, "terminal_store", TerminalStore(tmp_path / "terminal.json"))
+    isolated_main(user=user, cache_min_chars=1)
 
     upstream_calls = []
 
@@ -234,16 +222,11 @@ def test_terminal_error_returns_to_dify_and_bills_continuation(
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_terminal_register_storage_error_fails_open(
-    tmp_path: Path, monkeypatch, stream: bool
+    isolated_main, tmp_path: Path, monkeypatch, stream: bool
 ):
     user = "terminal-register-error"
-    monkeypatch.setattr(main, "DIFY_USER_ID", user)
-    monkeypatch.setattr(main, "LOG_REQUESTS", False)
-    monkeypatch.setattr(main, "store", SessionStore(tmp_path / "sessions.json"))
-    monkeypatch.setattr(main, "meter", UsageMeter(tmp_path / "usage.json"))
-    monkeypatch.setattr(main, "read_cache", ReadCache(tmp_path / "cache.json", min_chars=1))
     terminal = TerminalStore(tmp_path / "terminal.json")
-    monkeypatch.setattr(main, "terminal_store", terminal)
+    isolated_main(user=user, cache_min_chars=1, terminal_store=terminal)
 
     def broken_register(*_args, **_kwargs):
         raise OSError("disk full")
@@ -286,15 +269,12 @@ def test_terminal_register_storage_error_fails_open(
     assert terminal.pending_count(user) == 0
 
 
-def test_terminal_resolve_storage_error_returns_to_dify(tmp_path: Path, monkeypatch):
+def test_terminal_resolve_storage_error_returns_to_dify(
+    isolated_main, tmp_path: Path, monkeypatch
+):
     user = "terminal-resolve-error"
-    monkeypatch.setattr(main, "DIFY_USER_ID", user)
-    monkeypatch.setattr(main, "LOG_REQUESTS", False)
-    monkeypatch.setattr(main, "store", SessionStore(tmp_path / "sessions.json"))
-    monkeypatch.setattr(main, "meter", UsageMeter(tmp_path / "usage.json"))
-    monkeypatch.setattr(main, "read_cache", ReadCache(tmp_path / "cache.json", min_chars=1))
     terminal = TerminalStore(tmp_path / "terminal.json")
-    monkeypatch.setattr(main, "terminal_store", terminal)
+    isolated_main(user=user, cache_min_chars=1, terminal_store=terminal)
 
     def broken_resolve(*_args, **_kwargs):
         raise OSError("state unavailable")
@@ -340,14 +320,12 @@ def test_terminal_resolve_storage_error_returns_to_dify(tmp_path: Path, monkeypa
 
 
 def test_session_endpoints_clear_only_the_intended_terminal_pending(
-    tmp_path: Path, monkeypatch
+    isolated_main, tmp_path: Path, monkeypatch
 ):
     user = "terminal-session-lifecycle"
     sessions = SessionStore(tmp_path / "sessions.json")
     terminal = TerminalStore(tmp_path / "terminal.json")
-    monkeypatch.setattr(main, "DIFY_USER_ID", user)
-    monkeypatch.setattr(main, "store", sessions)
-    monkeypatch.setattr(main, "terminal_store", terminal)
+    isolated_main(user=user, session_store=sessions, terminal_store=terminal)
     tool = {
         "type": "tool_use",
         "id": "w1",
@@ -374,7 +352,7 @@ def test_session_endpoints_clear_only_the_intended_terminal_pending(
         assert terminal.clear_session(user, sid2) == 1
 
 
-def test_health_prunes_corrupt_terminal_epoch(tmp_path: Path, monkeypatch):
+def test_health_prunes_corrupt_terminal_epoch(isolated_main, tmp_path: Path):
     user = "terminal-health-corrupt"
     path = tmp_path / "terminal.json"
     path.write_text(
@@ -393,8 +371,7 @@ def test_health_prunes_corrupt_terminal_epoch(tmp_path: Path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(main, "DIFY_USER_ID", user)
-    monkeypatch.setattr(main, "terminal_store", TerminalStore(path))
+    isolated_main(user=user, terminal_store=TerminalStore(path))
     with TestClient(main.app) as client:
         response = client.get("/health")
     assert response.status_code == 200

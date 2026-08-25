@@ -4,13 +4,15 @@
 CC 请求的真实结构：
 - system：content blocks 列表；身份壳与 Harness 丢弃，Memory/Environment 等分段入对应字段
 - messages[user] 的 <system-reminder>：claudeMd / CLAUDE / MEMORY / currentDate
-- messages[role=system]：工具轨迹文案 → Tool_invocation；其余 → System_Description
+- 本轮 user 之后的 system 工具轨迹（CC 的 @ 预载）→ Current_Context
+- 更早的 messages[role=system] 工具轨迹 → Tool_invocation；其余 → System_Description
 - tool_use / tool_result 内容块 → Tool_invocation（正文唯一载体）；History 只留引用
 - 同一路径出现更新的完整 Read / Write 后，旧文件快照标为 superseded
 - 不写入：SYSTEM / Harness / Query（sys.query 另传）
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 from typing import Any
@@ -26,6 +28,7 @@ INPUT_KEYS = (
     "MEMORY",
     "currentDate",
     "Tool_invocation",
+    "Current_Context",
     "System_Description",
     "History",
 )
@@ -117,7 +120,7 @@ _TOOL_TRACE_SYSTEM_RE = re.compile(
 def _strip_banners(text: str) -> str:
     if not text:
         return ""
-    lines = [l for l in text.splitlines() if not _BANNER_ANY.match(l)]
+    lines = [line for line in text.splitlines() if not _BANNER_ANY.match(line)]
     return _OVERRIDE_BOILERPLATE.sub("", "\n".join(lines)).strip()
 
 
@@ -273,18 +276,104 @@ def _is_tool_trace_system_text(text: str) -> bool:
     ) or head.startswith("Result of calling the")
 
 
-def _tool_path(raw: Any) -> str:
-    if not isinstance(raw, dict):
+_SYSTEM_TRACE_CALL_RE = re.compile(
+    r"(?im)^Called the\s+(?P<name>[^\r\n]+?)\s+tool with the following input:\s*"
+)
+
+
+def _system_trace_calls(text: str) -> list[dict[str, Any]]:
+    """从 CC 的自然语言 system 轨迹中恢复工具名、输入与该次结果段。"""
+    source = text or ""
+    matches = list(_SYSTEM_TRACE_CALL_RE.finditer(source))
+    calls: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    for index, match in enumerate(matches):
+        tail = source[match.end() :].lstrip()
+        try:
+            raw_input, _end = decoder.raw_decode(tail)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw_input, dict):
+            continue
+        section_end = (
+            matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        )
+        calls.append(
+            {
+                "name": match.group("name").strip(),
+                "input": raw_input,
+                "section": source[match.start() : section_end],
+            }
+        )
+    return calls
+
+
+def _full_read_paths_from_system_traces(parts: list[str]) -> list[str]:
+    """找出本轮 @ 预载中的完整 Read；它们可取代历史中的同路径快照。"""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for text in parts:
+        for call in _system_trace_calls(text):
+            if str(call.get("name") or "").casefold() != "read":
+                continue
+            inp = call.get("input") or {}
+            if inp.get("offset") is not None or inp.get("limit") is not None:
+                continue
+            section = str(call.get("section") or "")
+            if "Result of calling the Read tool:" not in section:
+                continue
+            if "Wasted call" in section or "file unchanged since your last Read" in section:
+                continue
+            path = path_from_tool_input(inp)
+            normalized = normalize_path(path)
+            if path and normalized not in seen:
+                seen.add(normalized)
+                paths.append(path)
+    return paths
+
+
+def path_from_tool_input(raw: Any) -> str:
+    """从工具 input 取路径：dict 按别名顺序取；str 先试 JSON，再退回正则。"""
+    if raw is None:
         return ""
-    for key in ("file_path", "path", "filePath", "filename"):
-        value = raw.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    if isinstance(raw, dict):
+        for key in ("file_path", "path", "filePath", "filename"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+    if isinstance(raw, str):
+        s = raw.strip()
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                return path_from_tool_input(obj)
+        except Exception:
+            pass
+        m = re.search(r'file_path["\']?\s*[:=]\s*["\']([^"\']+)["\']', s, re.I)
+        if m:
+            return m.group(1).strip()
     return ""
 
 
-def _norm_tool_path(path: str) -> str:
-    return re.sub(r"\\+", r"\\", (path or "").replace("/", "\\")).casefold()
+def normalize_path(path: str) -> str:
+    """跨平台可比的路径键：去引号、剥 @ 前缀、斜杠归一、折叠重复分隔符、casefold。
+
+    UNC 的前导 `\\\\` 必须保留——它是路径身份的一部分，压成单斜杠会让
+    `\\\\server\\share\\a.py` 与 `\\server\\share\\a.py` 混为一谈。read_cache 的键
+    与「最新完整文件状态」的键同出此处，否则同一文件会在两套账里各算一个（守则 15）。
+    """
+    p = (path or "").strip().strip('"').strip("'")
+    if not p:
+        return ""
+    if p.startswith("@"):
+        p = p[1:]
+    p = p.replace("/", "\\")
+    if p.startswith("\\\\"):
+        p = "\\\\" + re.sub(r"\\+", r"\\", p[2:])
+    else:
+        p = re.sub(r"\\+", r"\\", p)
+    return p.casefold()
 
 
 def _trailing_user_index(messages: list) -> int:
@@ -581,7 +670,7 @@ def _tool_trace_index(messages: list) -> tuple[dict[str, dict[str, Any]], dict[s
                     "id": tid,
                     "name": str(block.get("name") or "?"),
                     "input": inp,
-                    "path": _tool_path(inp),
+                    "path": path_from_tool_input(inp),
                     "order": order,
                 }
             elif btype == "tool_result":
@@ -615,7 +704,7 @@ def _latest_full_file_states(
                 continue
             if "Wasted call" in body[:500] or "file unchanged since your last Read" in body[:500]:
                 continue
-        latest[_norm_tool_path(path)] = {
+        latest[normalize_path(path)] = {
             "id": tid,
             "name": call.get("name") or "?",
             "path": path,
@@ -652,10 +741,27 @@ def _compact_superseded_input(
 
 def _extract_tool_blocks_from_messages(
     messages: list,
+    *,
+    current_full_read_paths: list[str] | None = None,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
-    """工具原文的唯一载体；当前结果在 query，旧快照按最新完整状态折叠。"""
+    """工具原文的唯一载体；当前结果在 query，旧快照按最新文件状态折叠。"""
     calls, results = _tool_trace_index(messages)
     latest_states = _latest_full_file_states(calls, results)
+    external_order = max(
+        [int(x.get("order") or 0) for x in calls.values()]
+        + [int(x.get("order") or 0) for x in results.values()]
+        + [0]
+    )
+    for index, path in enumerate(current_full_read_paths or [], start=1):
+        normalized = normalize_path(path)
+        if not normalized:
+            continue
+        latest_states[normalized] = {
+            "id": "current-context:{}".format(index),
+            "name": "Current_Context",
+            "path": path,
+            "order": external_order + index,
+        }
     current_ids = _current_tool_result_ids(messages)
     parts: list[str] = []
     for m in messages:
@@ -672,9 +778,9 @@ def _extract_tool_blocks_from_messages(
                     call = calls.get(tid) or {
                         "name": b.get("name") or "?",
                         "input": b.get("input") if isinstance(b.get("input"), dict) else {},
-                        "path": _tool_path(b.get("input")),
+                        "path": path_from_tool_input(b.get("input")),
                     }
-                    latest = latest_states.get(_norm_tool_path(str(call.get("path") or "")))
+                    latest = latest_states.get(normalize_path(str(call.get("path") or "")))
                     raw_in = _compact_superseded_input(call, results.get(tid), latest)
                     try:
                         inp = json.dumps(raw_in, ensure_ascii=False) if raw_in is not None else ""
@@ -688,7 +794,7 @@ def _extract_tool_blocks_from_messages(
                 elif btype == "tool_result":
                     tid = str(b.get("tool_use_id") or b.get("id") or "")
                     call = calls.get(tid) or {}
-                    latest = latest_states.get(_norm_tool_path(str(call.get("path") or "")))
+                    latest = latest_states.get(normalize_path(str(call.get("path") or "")))
                     body = text_from_content(b.get("content"))
                     if tid in current_ids:
                         body = "(current result carried in sys.query)"
@@ -931,9 +1037,11 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
         if v:
             inputs[k] = v
 
-    # mid system messages：工具轨迹 → Tool_invocation；其余 → System_Description
+    # system 消息：本轮 user 后的 @ 预载 → Current_Context；更早的工具轨迹留在历史状态。
     system_msg_parts: list[str] = []
     tool_trace_from_system: list[str] = []
+    current_context_parts: list[str] = []
+    trailing_user_index = _trailing_user_index(messages)
     for message_index, m in enumerate(messages):
         if not isinstance(m, dict):
             continue
@@ -951,11 +1059,20 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
             if not text or is_cc_agent_identity(text):
                 continue
             if _is_tool_trace_system_text(text):
-                tool_trace_from_system.append(text.strip())
+                if (
+                    m.get("role") == "system"
+                    and trailing_user_index >= 0
+                    and message_index > trailing_user_index
+                ):
+                    current_context_parts.append(text.strip())
+                else:
+                    tool_trace_from_system.append(text.strip())
             else:
                 system_msg_parts.append(text)
     if system_msg_parts:
         inputs["System_Description"] = "\n\n".join(system_msg_parts).strip()
+    if current_context_parts:
+        inputs["Current_Context"] = "\n\n".join(current_context_parts).strip()
 
     # reminder 字段（优先含 system-reminder 的 user）
     reminder_src: list[str] = []
@@ -979,7 +1096,11 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
 
     # 工具轨迹
     tool_parts: list[str] = []
-    structured, tool_calls = _extract_tool_blocks_from_messages(conversation_messages)
+    current_full_read_paths = _full_read_paths_from_system_traces(current_context_parts)
+    structured, tool_calls = _extract_tool_blocks_from_messages(
+        conversation_messages,
+        current_full_read_paths=current_full_read_paths,
+    )
     if structured:
         tool_parts.append(structured)
     tool_parts.extend(tool_trace_from_system)
@@ -989,8 +1110,9 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
     history, current, hnotes = build_history_and_current(
         conversation_messages, compact_tool_results=True, calls=tool_calls
     )
-    history_full, _current_full, _ = build_history_and_current(conversation_messages)
     notes.extend(hnotes)
+    notes.append("current_context_parts={}".format(len(current_context_parts)))
+    notes.append("current_context_full_reads={}".format(len(current_full_read_paths)))
     notes.append(
         "agent_legacy_notifications={}".format(
             sum(len(blocks) for blocks in legacy_agent_notifications.values())
@@ -1007,13 +1129,8 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
         notes.append("query_empty_placeholder")
 
     cleaned = sparse_inputs(inputs)
-    # MEMORY / CLAUDE / claudeMd 再剥一次误入的 currentDate 尾
-    for k in ("MEMORY", "CLAUDE", "claudeMd"):
-        if cleaned.get(k):
-            cleaned[k] = _strip_context_tail(cleaned[k])
-            if not cleaned[k]:
-                del cleaned[k]
     if is_cc_agent_identity(cleaned.get("claudeMd") or ""):
+        # 主路径（_parse_reminder_inner 的 "Contents of" 分支）不查身份壳，此处补齐。
         cleaned.pop("claudeMd", None)
 
     notes.append("sparse_keys={}".format(len(cleaned)))
@@ -1022,8 +1139,9 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
         "query_user": query_user,
         "notes": notes,
         "history_chars": len(history or ""),
-        "history_full": history_full,
-        "history_full_chars": len(history_full or ""),
+        # 旁路枪要的「未去正文的完整历史」在这里只交出原料，由消费端按需折叠：
+        # 主枪用不到它，不该为一份自己不发送的几百 KB 字符串付代价。
+        "conversation_messages": conversation_messages,
         "current_user": current,
         "agent_lifecycle": agent_lifecycle,
     }
@@ -1037,7 +1155,7 @@ def materialize_inputs(
     """稀疏 → 送 Dify 的 inputs。
 
     - empty（title/recap/compact）：全键 ""，清会话变量
-    - strip（其它 haiku）：丢全部解析键；工具协议稍后可写回 System_Description
+    - strip（其它 haiku）：丢全部 INPUT_KEYS；工具协议稍后可写回 System_Description
     - None（主对话 / opus 子代理）：全键快照，空串用于覆盖上轮会话变量
     """
     src = {k: (v if isinstance(v, str) else str(v or "")) for k, v in (inputs or {}).items()}
@@ -1173,8 +1291,6 @@ def image_b64_byte_len(img: dict[str, Any]) -> int:
     if not data:
         return 0
     try:
-        import base64
-
         raw = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
         return len(base64.b64decode(raw, validate=False)) if raw else 0
     except Exception:

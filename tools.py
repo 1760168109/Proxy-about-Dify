@@ -31,11 +31,35 @@ AFTER_SUCCESS_OPEN = "[[after_success]]"
 AFTER_SUCCESS_CLOSE = "[[/after_success]]"
 TERMINAL_TOOL_NAMES = frozenset(("Write", "Edit"))
 
-# 投机流式截停标记（半截前缀由 answer 的 holdback 兜住）。
-STREAM_CUT_MARKERS = tuple(o for o, _ in TOOL_MARKERS) + (AFTER_SUCCESS_OPEN,)
-
 TOOLS_JSON_OPEN = "[[cc_tools_json]]"
 TOOLS_JSON_CLOSE = "[[/cc_tools_json]]"
+TOOLS_ON_MARKER = "[[cc_tools:on]]"
+RAW_OPEN_PREFIX = "[[raw:"
+RAW_CLOSE_PREFIX = "[[/raw:"
+CODE_FENCE = "```"
+
+# 协议标记的单一权威表。下面两个派生视图与 _PROTOCOL_RESIDUE_RE 各有不同覆盖面，
+# 这是有理由的——截停要早（含代码围栏，因结构化围栏常被 ``` 包裹）、残留检测要宽
+# （正则，能吃任意 raw 键名与开闭两向）、草案定位要准（子串比较，且排除
+# after_success 自身）。原先三处各自枚举，同步全靠人记；现在改由此表派生。
+# 表与正则的同步由 test_tools.py 的 sync 用例锁住。
+_MARKER_PAIRS: tuple[tuple[str, str], ...] = TOOL_MARKERS + (
+    (AFTER_SUCCESS_OPEN, AFTER_SUCCESS_CLOSE),
+    (TOOLS_JSON_OPEN, TOOLS_JSON_CLOSE),
+)
+
+# 视图一：投机流式截停（半截前缀由 answer 的 holdback 兜住）
+STREAM_CUT_MARKERS = tuple(open_m for open_m, _ in _MARKER_PAIRS) + (CODE_FENCE,)
+
+# 视图二：终结草案开标记之后不得再出现的协议标记
+_POST_DRAFT_FORBIDDEN = tuple(
+    marker.lower() for pair in TOOL_MARKERS for marker in pair
+) + (
+    RAW_OPEN_PREFIX,
+    RAW_CLOSE_PREFIX,
+    TOOLS_JSON_OPEN.lower(),
+    TOOLS_JSON_CLOSE.lower(),
+)
 
 TOOL_CONTINUE_MARKER = "[[cc_tool_continue]]"
 
@@ -50,15 +74,17 @@ class AfterSuccessParse:
     valid: bool = False
     reason: str = "none"
 
+_ASK_HEADER_MAX = 12
+
 # AskUserQuestion：目录提示与归一共用，防双写漂移
 ASK_USER_QUESTION_SHAPE = {
     "required": ("question", "header", "options", "multiSelect"),
     "option_keys": ("label", "description", "preview"),
-    "header_max": 12,
+    "header_max": _ASK_HEADER_MAX,
     "catalog_hint": (
         "questions[].required: question,header,options,multiSelect; "
         "options[]: label,description only (forbid id/text/value on question; "
-        "forbid value on option); header max 12 chars"
+        "forbid value on option); header max {} chars".format(_ASK_HEADER_MAX)
     ),
 }
 
@@ -105,12 +131,20 @@ Edit 同理用 [[raw:old_string]] 与 [[raw:new_string]] 两个原文块。唯�
 [[/tool_use]]
 """
 
+# 两份 query 尾注共享的依赖判据。四类依赖须与 TOOL_PROTOCOL_TEXT 第 6 条逐字一致：
+# 「共享可变目标」正是「同一文件 Edit A + Edit A 须合并」的依据（守则 16），
+# 而按约束居近，尾注才是最可能被遵守的那一份，不得比远处那份少一类。
+_BATCH_RULE_NEAR = (
+    "同一认知阶段里无数据、控制流、共享可变目标或副作用顺序依赖的调用一次列全；"
+    "同一文件的变更须合并或串行。"
+)
+
 TOOL_QUERY_REMINDER = (
-    "\n\n[[cc_tools:on]] 需要本机读盘/命令时，必须输出 [[tool_use]]...[[/tool_use]]；"
+    "\n\n" + TOOLS_ON_MARKER + " 需要本机读盘/命令时，必须输出 [[tool_use]]...[[/tool_use]]；"
     "仅文字描述不会执行工具、也不会弹出权限确认。"
     "若本枪调用工具，工具前只能简述下一步，严禁提前声称完成或给最终结论；tool_result 返回后再确认。"
-    "同一认知阶段里无数据、控制流或副作用顺序依赖的调用一次列全；同一文件的变更须合并或串行。"
-    "若全部调用仅为终结性的 Write/Edit，可在末尾附一段完整 [[after_success]] 成功答复草案；其他工具禁用。"
+    + _BATCH_RULE_NEAR
+    + "若全部调用仅为终结性的 Write/Edit，可在末尾附一段完整 [[after_success]] 成功答复草案；其他工具禁用。"
     "长文本参数（如 Write.content）用 [[raw:键名]]…[[/raw:键名]] 原文块，勿在 JSON 里转义长内容。"
     "AskUserQuestion 须 question+header+options+multiSelect（勿用 text 代替 question）。"
 )
@@ -128,10 +162,10 @@ TOOL_PROTOCOL_TEXT_STRUCT = """『工具协议 · 结构化出口 · Claude Code
 """
 
 TOOL_QUERY_REMINDER_STRUCT = (
-    "\n\n[[cc_tools:on]] 本枪为结构化出口：整个回答 = {\"reply\", \"tool_calls\"} 单个 JSON 对象；"
+    "\n\n" + TOOLS_ON_MARKER + " 本枪为结构化出口：整个回答 = {\"reply\", \"tool_calls\"} 单个 JSON 对象；"
     "需要本机操作时把调用放进 tool_calls，且 reply 必须为空；tool_result 返回后再给结论。"
-    "同一认知阶段里无数据、控制流或副作用顺序依赖的调用一次列全；同一文件的变更须合并或串行。"
-    "勿在 reply 里写 [[tool_use]] 标记。"
+    + _BATCH_RULE_NEAR
+    + "勿在 reply 里写 [[tool_use]] 标记。"
 )
 
 # ── 目录 ─────────────────────────────────────────────────────────────
@@ -272,7 +306,7 @@ def append_tools_reminder_to_query(
     if not enabled:
         return query
     q = query or ""
-    if "[[cc_tools:on]]" in q:
+    if TOOLS_ON_MARKER in q:
         return q
     return q.rstrip() + (TOOL_QUERY_REMINDER_STRUCT if structured else TOOL_QUERY_REMINDER)
 
@@ -612,7 +646,7 @@ def _scan_raw_field_blocks(text: str, pos: int) -> tuple[dict[str, str], int, bo
         if not m:
             return fields, i, True
         key = m.group(1)
-        close = "[[/raw:{}]]".format(key.lower())
+        close = "{}{}]]".format(RAW_CLOSE_PREFIX, key.lower())
         start = m.end()
         if text.startswith("\r\n", start):
             start += 2
@@ -785,6 +819,8 @@ def extract_after_success(text: str) -> tuple[str, str]:
     return parsed.visible, parsed.success if parsed.valid else ""
 
 
+# 视图三：残留检测。覆盖面须不小于 _MARKER_PAIRS——它额外吃任意 raw 键名，
+# 故不从表机械派生；两者的同步由 test_tools.py 的 sync 用例锁住。
 _PROTOCOL_RESIDUE_RE = re.compile(
     r"(?i)(?:"
     r"\[\[\s*/?\s*(?:tool_uses?|raw(?::[^\]\r\n]+)?|after_success|cc_tools_json)\s*\]\]"
@@ -805,9 +841,7 @@ def terminal_draft_follows_tools(source: str) -> bool:
     if start < 0:
         return True
     tail = low[start + len(AFTER_SUCCESS_OPEN) :]
-    markers = [marker for pair in TOOL_MARKERS for marker in pair]
-    markers.extend(("[[raw:", "[[/raw:", TOOLS_JSON_OPEN, TOOLS_JSON_CLOSE))
-    return not any(marker.lower() in tail for marker in markers)
+    return not any(marker in tail for marker in _POST_DRAFT_FORBIDDEN)
 
 
 def is_terminal_tool_batch(tool_uses: list[dict[str, Any]]) -> bool:

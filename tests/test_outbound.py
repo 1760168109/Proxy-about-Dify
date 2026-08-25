@@ -2,10 +2,14 @@
 """出站装配：need_read / 缓存重放 / 标记次序 / 结构化标记。"""
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+import outbound as outbound_module
 from cache import (
     ReadCache,
     ingest_messages_into_cache,
@@ -14,13 +18,19 @@ from cache import (
     should_annotate_need_read,
 )
 from outbound import (
-    annotate_query_for_images,
+    DifyInputLengthError,
+    attach_images_to_outbound,
     format_agent_lifecycle_block,
     inject_marker_after_route,
     prepare_text_outbound,
 )
 from parse import parse_payload
 from plan import build_plan
+from unicode_wire import (
+    DIFY_PERSISTED_VARIABLE_SIZE_LIMIT,
+    DifyPersistenceSizeError,
+    decode_unicode_wire_text,
+)
 
 
 def _long(n: int = 20) -> str:
@@ -35,6 +45,236 @@ def test_route_marker_stays_first():
     assert q2.startswith("[[cc_route:opus]]")
     # 幂等
     assert inject_marker_after_route(q2, "[[cc_images:1]] img") == q2
+
+
+def test_prepare_outbound_keeps_large_states_separate_and_wires_non_bmp_losslessly():
+    tool_state = "史" * 65_000 + "💡"
+    current_state = "今" * 65_000 + "💡"
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {
+            "Tool_invocation": tool_state,
+            "Current_Context": current_state,
+        },
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+
+    outbound = prepare_text_outbound(
+        body=body,
+        plan=build_plan(body),
+        parsed=parsed,
+        user_id="u",
+        read_cache=None,
+        input_char_limits={"Tool_invocation": 70_000, "Current_Context": 70_000},
+        input_limits_source="test",
+    )
+
+    assert outbound.query.splitlines()[0] == "[[cc_route:opus]]"
+    assert outbound.unicode_wire_active is True
+    assert "[[cc_unicode_wire:on]]" in outbound.query.splitlines()[1:]
+    assert decode_unicode_wire_text(outbound.dify_inputs["Tool_invocation"]) == tool_state
+    assert decode_unicode_wire_text(outbound.dify_inputs["Current_Context"]) == current_state
+    assert all(
+        size <= DIFY_PERSISTED_VARIABLE_SIZE_LIMIT
+        for size in outbound.persisted_input_sizes.values()
+    )
+    assert outbound.input_limits_source == "test"
+
+
+def test_prepare_outbound_rejects_configured_character_overflow_without_truncation():
+    content = "汉" * 110_000
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {"Current_Context": content},
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+
+    with pytest.raises(DifyInputLengthError) as caught:
+        prepare_text_outbound(
+            body=body,
+            plan=build_plan(body),
+            parsed=parsed,
+            user_id="u",
+            read_cache=None,
+            input_char_limits={"Current_Context": 100_000},
+            input_limits_source="test",
+        )
+
+    assert caught.value.key == "Current_Context"
+    assert caught.value.length == 110_000
+    assert caught.value.limit == 100_000
+    assert parsed["inputs"]["Current_Context"] == content
+
+
+def test_prepare_outbound_rejects_persisted_variable_overflow_as_a_distinct_boundary():
+    content = "汉" * 110_000
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {"Current_Context": content},
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+
+    with pytest.raises(DifyPersistenceSizeError) as caught:
+        prepare_text_outbound(
+            body=body,
+            plan=build_plan(body),
+            parsed=parsed,
+            user_id="u",
+            read_cache=None,
+            input_char_limits={"Current_Context": 233_333},
+            input_limits_source="test",
+        )
+
+    assert caught.value.key == "Current_Context"
+    assert caught.value.size > DIFY_PERSISTED_VARIABLE_SIZE_LIMIT
+    assert parsed["inputs"]["Current_Context"] == content
+
+
+def test_prepare_outbound_shards_an_oversized_logical_input_losslessly():
+    content = "汉" * 119_173
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {"Tool_invocation": content},
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+    limits = {
+        "Tool_invocation": 233_333,
+        "Tool_invocation_1": 233_333,
+        "Tool_invocation_2": 233_333,
+        "Tool_invocation_3": 233_333,
+    }
+
+    outbound = prepare_text_outbound(
+        body=body,
+        plan=build_plan(body),
+        parsed=parsed,
+        user_id="u",
+        read_cache=None,
+        input_char_limits=limits,
+        input_limits_source="test",
+    )
+
+    used = outbound.input_shards["Tool_invocation"]
+    assert used == ("Tool_invocation_1", "Tool_invocation_2")
+    assert outbound.dify_inputs["Tool_invocation"] == ""
+    assert outbound.dify_inputs["Tool_invocation_3"] == ""
+    assert "".join(outbound.dify_inputs[key] for key in used) == content
+    assert parsed["inputs"]["Tool_invocation"] == content
+    assert outbound.tool_invocation_chars == len(content)
+    assert "[[cc_input_shards:on]]" in outbound.query
+    assert "Tool_invocation_1 -> Tool_invocation_2" in outbound.query
+    assert all(
+        size <= DIFY_PERSISTED_VARIABLE_SIZE_LIMIT
+        for size in outbound.persisted_input_sizes.values()
+    )
+
+
+def test_prepare_outbound_shards_after_unicode_wire_without_splitting_tokens():
+    content = "汉" * 105_000 + "💡"
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {"Current_Context": content},
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+    limits = {
+        "Current_Context": 233_333,
+        "Current_Context_1": 60_000,
+        "Current_Context_2": 60_000,
+    }
+
+    outbound = prepare_text_outbound(
+        body=body,
+        plan=build_plan(body),
+        parsed=parsed,
+        user_id="u",
+        read_cache=None,
+        input_char_limits=limits,
+        input_limits_source="test",
+    )
+
+    used = outbound.input_shards["Current_Context"]
+    wired = "".join(outbound.dify_inputs[key] for key in used)
+    assert decode_unicode_wire_text(wired) == content
+    assert all(not chunk.endswith("⟦") for chunk in (
+        outbound.dify_inputs[key] for key in used[:-1]
+    ))
+
+
+def test_prepare_outbound_clears_published_shards_when_base_field_fits():
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {"History": "短历史"},
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+
+    outbound = prepare_text_outbound(
+        body=body,
+        plan=build_plan(body),
+        parsed=parsed,
+        user_id="u",
+        read_cache=None,
+        input_char_limits={
+            "History": 233_333,
+            "History_1": 233_333,
+            "History_2": 233_333,
+        },
+        input_limits_source="test",
+    )
+
+    assert outbound.dify_inputs["History"] == "短历史"
+    assert outbound.dify_inputs["History_1"] == ""
+    assert outbound.dify_inputs["History_2"] == ""
+    assert outbound.input_shards == {}
+
+
+def test_prepare_outbound_rejects_when_published_shards_are_insufficient():
+    content = "汉" * 180_000
+    body = {
+        "model": "alan",
+        "messages": [{"role": "user", "content": "继续分析"}],
+    }
+    parsed = {
+        "inputs": {"History": content},
+        "query_user": "继续分析",
+        "agent_lifecycle": {},
+    }
+
+    with pytest.raises(DifyPersistenceSizeError):
+        prepare_text_outbound(
+            body=body,
+            plan=build_plan(body),
+            parsed=parsed,
+            user_id="u",
+            read_cache=None,
+            input_char_limits={"History": 233_333, "History_1": 233_333},
+            input_limits_source="test",
+        )
+
+    assert parsed["inputs"]["History"] == content
 
 
 def test_user_text_mentioning_marker_does_not_suppress_proxy_block():
@@ -74,6 +314,67 @@ def test_need_read_judgement():
     assert not should_annotate_need_read(r"@x\a.md q", read_ti)
 
 
+def test_current_context_read_satisfies_need_read_guard():
+    body = {
+        "model": "alan",
+        "messages": [
+            {"role": "user", "content": r"请分析 @x\a.md"},
+            {
+                "role": "system",
+                "content": (
+                    'Called the Read tool with the following input: {"file_path":"C:\\\\x\\\\a.md"}\n'
+                    "Result of calling the Read tool:\n" + _long(30)
+                ),
+            },
+        ],
+    }
+    parsed = parse_payload(body)
+    outbound = prepare_text_outbound(
+        body=body,
+        plan=build_plan(body),
+        parsed=parsed,
+        user_id="u",
+        read_cache=None,
+    )
+
+    assert parsed["inputs"].get("Current_Context")
+    assert outbound.need_read is False
+    assert "[[cc_need_read]]" not in outbound.query
+
+
+def test_strip_gun_loses_preload_but_still_gets_need_read():
+    """strip 档丢掉 Current_Context 之后，那一枪至少要知道正文可以要。
+
+    need_read 的判据必须取物化**后**的 inputs：看物化前的 sparse 会认定「已有正文」而咽下
+    提示，于是这枪既没有正文、也不知道正文可以要（fail-silent）。上一行那个 opus 用例是
+    它的对照——同一份 body，只有模型档不同。
+    """
+    body = {
+        "model": "claude-haiku-4-5",
+        "messages": [
+            {"role": "user", "content": r"请分析 @x\a.md"},
+            {
+                "role": "system",
+                "content": (
+                    'Called the Read tool with the following input: {"file_path":"C:\\\\x\\\\a.md"}\n'
+                    "Result of calling the Read tool:\n" + _long(30)
+                ),
+            },
+        ],
+    }
+    parsed = parse_payload(body)
+    plan = build_plan(body)
+    ob = prepare_text_outbound(
+        body=body, plan=plan, parsed=parsed, user_id="u", read_cache=None
+    )
+
+    assert plan.route == "haiku" and plan.trim_mode == "strip" and not plan.is_sidecar_summary
+    assert parsed["inputs"].get("Current_Context")  # 物化前在
+    assert not ob.dify_inputs.get("Current_Context")  # 物化后丢了（strip 的设计）
+    assert ob.need_read is True  # 但提示补上了
+    assert "[[cc_need_read]]" in ob.query
+
+
 def test_wasted_and_cache_roundtrip():
     assert is_wasted_call("Wasted call — file unchanged since your last Read.")
     with tempfile.TemporaryDirectory() as td:
@@ -81,9 +382,44 @@ def test_wasted_and_cache_roundtrip():
         path = r"C:\work\cfg.env"
         text = "KEY=value\n" * 5
         assert cache.put("u", path, text)
-        assert cache.get("u", path) == text.strip()
+        assert cache.get("u", path) == text
         # 路径归一：正反斜杠、大小写
-        assert cache.get("u", "c:/work/CFG.ENV") == text.strip()
+        assert cache.get("u", "c:/work/CFG.ENV") == text
+
+
+def test_partial_read_does_not_overwrite_full_read_cache():
+    with tempfile.TemporaryDirectory() as td:
+        cache = ReadCache(Path(td) / "c.json", min_chars=10)
+        path = r"C:\work\partial.md"
+        full = "full file contents\n" * 4
+        assert cache.put("u", path, full)
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "r1",
+                            "name": "Read",
+                            "input": {"file_path": path, "offset": 0, "limit": 5},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "r1",
+                            "content": "short",
+                        }
+                    ],
+                },
+            ]
+        }
+        ingest_messages_into_cache(body, cache, "u")
+        assert cache.get("u", path) == full
 
 
 def test_write_refreshes_read_cache_and_edit_is_idempotent():
@@ -119,7 +455,7 @@ def test_write_refreshes_read_cache_and_edit_is_idempotent():
             ]
         }
         ingest_messages_into_cache(write_body, cache, "u")
-        assert cache.get("u", path) == written.strip()
+        assert cache.get("u", path) == written
 
         edit_body = {
             "messages": [
@@ -761,8 +1097,24 @@ def test_agent_lifecycle_marker_skips_sidecar_and_non_main_window():
     assert "[[cc_agents:" not in sidecar.query
 
 
-def test_agent_marker_coexists_with_struct_need_read_and_images():
+def test_agent_marker_coexists_with_struct_need_read_and_images(monkeypatch):
     body = _agent_body(state="pending", trailing_path_query=True)
+    # 末条 user 带一张图，让附图走真实注入路径（attach_images_to_outbound）。
+    # 若由测试自己调 annotate_query_for_images 拼 query，注入方式改了也不会红。
+    body["messages"][-1] = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": r"@C:\work\note.md 请核对"},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGk=",
+                },
+            },
+        ],
+    }
     parsed = parse_payload(body)
     ob = prepare_text_outbound(
         body=body,
@@ -771,8 +1123,36 @@ def test_agent_marker_coexists_with_struct_need_read_and_images():
         user_id="u",
         read_cache=None,
     )
-    ob.query = annotate_query_for_images(ob.query, 1)
 
+    async def fake_upload_images(images, **_kwargs):
+        assert [img["media_type"] for img in images] == ["image/png"]
+        return (
+            [
+                {
+                    "type": "image",
+                    "transfer_method": "local_file",
+                    "upload_file_id": "f1",
+                }
+            ],
+            ["image_1_uploaded"],
+            [{"source_index": 0, "status": "ok", "file_index": 0}],
+        )
+
+    monkeypatch.setattr(outbound_module, "upload_images", fake_upload_images)
+    ob = asyncio.run(
+        attach_images_to_outbound(
+            ob,
+            body=body,
+            client=None,
+            base_url="https://example.invalid",
+            api_key="key",
+            user="u",
+            is_sidecar=False,
+        )
+    )
+
+    assert ob.image_upload_status == "ok"
+    assert ob.image_mapping == [{"source_index": 0, "status": "ok", "file_index": 0}]
     assert ob.need_read is True
     assert ob.query.splitlines()[0] == "[[cc_route:opus]]"
     for marker in (

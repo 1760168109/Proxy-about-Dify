@@ -51,6 +51,17 @@ def test_main_chat_opus_attaches():
     assert p.enable_tools and p.attach_main and p.is_main_window
 
 
+def test_discovered_model_id_routes_opus():
+    body = {
+        "model": "anthropic/alan",
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [{"role": "user", "content": "你好"}],
+    }
+    p = build_plan(body)
+    assert p.route == "opus"
+    assert p.model == "anthropic/alan"
+
+
 def test_smoke_token_forces_haiku():
     body = {
         "model": "alan",
@@ -61,6 +72,21 @@ def test_smoke_token_forces_haiku():
     assert p.route == "haiku"
     assert p.trim_mode == "strip"
     assert not p.attach_main
+
+
+def test_old_history_control_markers_do_not_route_current_turn():
+    body = {
+        "model": "alan",
+        "system": "You are Claude Code",
+        "messages": [
+            {"role": "user", "content": "testandlife 旧冒烟轮"},
+            {"role": "assistant", "content": "旧结果"},
+            {"role": "user", "content": "现在继续做正常分析"},
+        ],
+    }
+    p = build_plan(body)
+    assert p.route == "opus"
+    assert p.attach_main is True
 
 
 def test_model_name_haiku_routes_haiku():
@@ -109,9 +135,52 @@ def test_compact_detection():
         "tools": [{"name": "Read", "input_schema": {}}],
     }
     p = build_plan(body)
-    assert p.kind == "compact" and p.route == "haiku"
+    # 压缩有损，独走 opus 换质量；枪型仍是旁路，故不续指针、inputs 全清、历史进 query。
+    assert p.kind == "compact" and p.route == "opus"
     assert not p.enable_tools and not p.attach_main
     assert p.trim_mode == "empty"
+    assert p.query_mode == "history_current"
+    assert not p.is_main_window
+
+
+def test_compact_marker_fallback_matches_real_compact_gun():
+    """双 ESC 的兜底指纹须产出与真 compact 完全一致的策略，不得只改 route 一项。"""
+    body = {
+        "model": "alan",
+        "system": "You are Claude Code",
+        "messages": [
+            {"role": "user", "content": "Please compact the conversation so far."}
+        ],
+        "tools": [{"name": "Read", "input_schema": {}}],
+    }
+    p = build_plan(body)
+    assert p.kind == "compact" and p.route == "opus"
+    assert p.trim_mode == "empty" and p.query_mode == "history_current"
+    assert not p.attach_main and not p.is_main_window and not p.enable_tools
+
+
+def test_title_wins_over_compact_marker_and_route_follows_kind():
+    """两套旁路指纹交叉命中时，route 必须跟着 kind，不得各判一次优先级。
+
+    kind 判 title 优先、route 判 compact 优先，曾使这类枪按 title 折叠（title_fold、
+    落 folded_query、by_kind["title"]+1）却按 opus 单价计费。CC 的标题生成提示里
+    出现 summarize 字样即可触发，不是理论组合。
+    """
+    body = {
+        "model": "alan",
+        "system": (
+            "Generate a concise, sentence-case title. "
+            'Return JSON with a single "title" field.'
+        ),
+        "messages": [
+            {"role": "user", "content": "Summarize this conversation into a title."}
+        ],
+    }
+    p = build_plan(body)
+    assert p.kind == "title" and p.route == "haiku"
+    assert p.query_mode == "title_fold" and p.trim_mode == "empty"
+    # 交叉命中须留证，否则事后无法按守则 10 对指纹
+    assert "compact_marker_overridden" in p.route_reasons
 
 
 # ── 流式裁决：省略 stream → JSON；Accept 头可请求 SSE ──

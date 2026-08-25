@@ -5,13 +5,12 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
 from pathlib import Path
 from typing import Any
 
-from persist import atomic_write_json, utc_now
+from persist import atomic_write_json, read_json_dict, utc_now
 
 
 def _fenv(name: str, default: float) -> float:
@@ -24,11 +23,32 @@ def _fenv(name: str, default: float) -> float:
         return default
 
 
+def _stored_float(data: dict[str, Any], key: str, default: float) -> float:
+    value = data.get(key)
+    try:
+        return default if value is None else float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _estimated_usd(
+    opus_calls: int, haiku_calls: int, opus_unit: float, haiku_unit: float
+) -> float:
+    """次数 × 当前单价。不作增量累加——改单价即全量重估。
+
+    守则 6：账本口径只能有一份定义，落盘值与展示值必须同式。
+    """
+    return round(opus_calls * opus_unit + haiku_calls * haiku_unit, 4)
+
+
+DEFAULT_OPUS_USD = 1.0
+DEFAULT_HAIKU_USD = 0.0
+
+
 class UsageMeter:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self._write(self._empty())
 
@@ -38,22 +58,15 @@ class UsageMeter:
             "opus_calls": 0,
             "haiku_calls": 0,
             "other_calls": 0,
-            "opus_usd_per_call": _fenv("OPUS_USD_PER_CALL", 1.0),
-            "haiku_usd_per_call": _fenv("HAIKU_USD_PER_CALL", 0.0),
+            "opus_usd_per_call": _fenv("OPUS_USD_PER_CALL", DEFAULT_OPUS_USD),
+            "haiku_usd_per_call": _fenv("HAIKU_USD_PER_CALL", DEFAULT_HAIKU_USD),
             "estimated_usd": 0.0,
             "by_kind": {},
             "last": None,
         }
 
     def _read(self) -> dict[str, Any]:
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            if not raw.strip():
-                return self._empty()
-            data = json.loads(raw)
-            return data if isinstance(data, dict) else self._empty()
-        except (OSError, json.JSONDecodeError):
-            return self._empty()
+        return read_json_dict(self.path, self._empty)
 
     def _write(self, data: dict[str, Any]) -> None:
         atomic_write_json(self.path, data)
@@ -69,10 +82,12 @@ class UsageMeter:
         with self._lock:
             data = self._read()
             opus_unit = _fenv(
-                "OPUS_USD_PER_CALL", float(data.get("opus_usd_per_call") or 1.0)
+                "OPUS_USD_PER_CALL",
+                _stored_float(data, "opus_usd_per_call", DEFAULT_OPUS_USD),
             )
             haiku_unit = _fenv(
-                "HAIKU_USD_PER_CALL", float(data.get("haiku_usd_per_call") or 0.0)
+                "HAIKU_USD_PER_CALL",
+                _stored_float(data, "haiku_usd_per_call", DEFAULT_HAIKU_USD),
             )
             data["opus_usd_per_call"] = opus_unit
             data["haiku_usd_per_call"] = haiku_unit
@@ -88,11 +103,11 @@ class UsageMeter:
             else:
                 data["other_calls"] = int(data.get("other_calls") or 0) + 1
 
-            # 与 _snapshot 同式（次数 × 当前单价）；不作增量累加，改单价即全量重估
-            data["estimated_usd"] = round(
-                int(data.get("opus_calls") or 0) * opus_unit
-                + int(data.get("haiku_calls") or 0) * haiku_unit,
-                4,
+            data["estimated_usd"] = _estimated_usd(
+                int(data.get("opus_calls") or 0),
+                int(data.get("haiku_calls") or 0),
+                opus_unit,
+                haiku_unit,
             )
             by = data.get("by_kind")
             if not isinstance(by, dict):
@@ -121,10 +136,9 @@ class UsageMeter:
     def _snapshot(self, data: dict[str, Any]) -> dict[str, Any]:
         opus = int(data.get("opus_calls") or 0)
         haiku = int(data.get("haiku_calls") or 0)
-        opus_unit = float(data.get("opus_usd_per_call") or 1.0)
-        haiku_unit = float(data.get("haiku_usd_per_call") or 0.0)
-        # 按当前单价重算展示，防改 env 后旧累计偏差
-        est = round(opus * opus_unit + haiku * haiku_unit, 4)
+        opus_unit = _stored_float(data, "opus_usd_per_call", DEFAULT_OPUS_USD)
+        haiku_unit = _stored_float(data, "haiku_usd_per_call", DEFAULT_HAIKU_USD)
+        est = _estimated_usd(opus, haiku, opus_unit, haiku_unit)
         return {
             "updated_at": data.get("updated_at"),
             "opus_calls": opus,
