@@ -102,7 +102,7 @@ Claude Code 的流式空闲看门狗独立于总 API timeout；若任务期间�
 | 键 | 默认 | 含义 |
 |:---|:---|:---|
 | `DIFY_BASE_URL` | `https://api.dify.ai/v1` | 上游 |
-| `DIFY_USER_ID` | `Liu Sheng` | Dify user + 本地状态分桶 |
+| `DIFY_USER_ID` | `Liu Sheng`（这是柳生的ID，你要填你自己的） | Dify user + 本地状态分桶 |
 | `DIFY_API_KEY` | 空 | 兜底 Key（优先用请求头） |
 | `HOST` / `PORT` | `127.0.0.1` / `7272` | 监听 |
 | `ADMIN_TOKEN` | 空（仅本机免 token） | 外部监听时保护会话、账本重置和调试管理端点 |
