@@ -171,18 +171,120 @@ def test_prepare_outbound_shards_an_oversized_logical_input_losslessly():
     )
 
     used = outbound.input_shards["Tool_invocation"]
-    assert used == ("Tool_invocation_1", "Tool_invocation_2")
-    assert outbound.dify_inputs["Tool_invocation"] == ""
-    assert outbound.dify_inputs["Tool_invocation_3"] == ""
+    assert used == ("Tool_invocation", "Tool_invocation_1")
+    assert outbound.dify_inputs["Tool_invocation"]
+    assert outbound.dify_inputs["Tool_invocation_2"] == ""
     assert "".join(outbound.dify_inputs[key] for key in used) == content
     assert parsed["inputs"]["Tool_invocation"] == content
     assert outbound.tool_invocation_chars == len(content)
     assert "[[cc_input_shards:on]]" in outbound.query
-    assert "Tool_invocation_1 -> Tool_invocation_2" in outbound.query
+    assert "Tool_invocation -> Tool_invocation_1" in outbound.query
     assert all(
         size <= DIFY_PERSISTED_VARIABLE_SIZE_LIMIT
         for size in outbound.persisted_input_sizes.values()
     )
+
+
+def test_duplicate_partial_reads_and_base_shard_recover_incident_capacity():
+    background = "底" * 500_000
+    views = [
+        "OLD_VIEW_ONE\n" + "甲" * 71_000,
+        "OLD_VIEW_TWO\n" + "乙" * 71_000,
+        "LATEST_VIEW\n" + "丙" * 71_000,
+    ]
+    messages = [
+        {"role": "user", "content": "检查长上下文"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "shell1",
+                    "name": "PowerShell",
+                    "input": {"command": "Get-Long-State"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "shell1",
+                    "content": background,
+                }
+            ],
+        },
+    ]
+    for index, view in enumerate(views, start=1):
+        tool_id = f"read{index}"
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Read",
+                            "input": {
+                                "file_path": r"C:\work\large.md",
+                                "offset": 700,
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": view,
+                        }
+                    ],
+                },
+            ]
+        )
+    messages.extend(
+        [
+            {"role": "assistant", "content": "已读取"},
+            {"role": "user", "content": "继续"},
+        ]
+    )
+    body = {"model": "alan", "messages": messages}
+    parsed = parse_payload(body)
+    logical = parsed["inputs"]["Tool_invocation"]
+    limits = {
+        "Tool_invocation": 233_333,
+        **{f"Tool_invocation_{index}": 233_333 for index in range(1, 7)},
+    }
+
+    outbound = prepare_text_outbound(
+        body=body,
+        plan=build_plan(body),
+        parsed=parsed,
+        user_id="u",
+        read_cache=None,
+        input_char_limits=limits,
+        input_limits_source="test",
+    )
+
+    assert "OLD_VIEW_ONE" not in logical
+    assert "OLD_VIEW_TWO" not in logical
+    assert logical.count("LATEST_VIEW") == 1
+    assert 569_826 < len(logical) < 664_797
+    used = outbound.input_shards["Tool_invocation"]
+    assert used == (
+        "Tool_invocation",
+        "Tool_invocation_1",
+        "Tool_invocation_2",
+        "Tool_invocation_3",
+        "Tool_invocation_4",
+        "Tool_invocation_5",
+        "Tool_invocation_6",
+    )
+    assert "".join(outbound.dify_inputs[key] for key in used) == logical
 
 
 def test_prepare_outbound_shards_after_unicode_wire_without_splitting_tokens():
@@ -252,7 +354,7 @@ def test_prepare_outbound_clears_published_shards_when_base_field_fits():
 
 
 def test_prepare_outbound_rejects_when_published_shards_are_insufficient():
-    content = "汉" * 180_000
+    content = "汉" * 220_000
     body = {
         "model": "alan",
         "messages": [{"role": "user", "content": "继续分析"}],

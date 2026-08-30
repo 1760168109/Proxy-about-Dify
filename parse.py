@@ -8,6 +8,7 @@ CC 请求的真实结构：
 - 更早的 messages[role=system] 工具轨迹 → Tool_invocation；其余 → System_Description
 - tool_use / tool_result 内容块 → Tool_invocation（正文唯一载体）；History 只留引用
 - 同一路径出现更新的完整 Read / Write 后，旧文件快照标为 superseded
+- 同一路径、同一 offset/limit 的局部 Read 重复时，只保留最新成功视图
 - 不写入：SYSTEM / Harness / Query（sys.query 另传）
 """
 from __future__ import annotations
@@ -253,13 +254,28 @@ def _parse_reminder_inner(blob: str) -> dict[str, str]:
 
 
 def _extract_local_command_blocks(text: str) -> str:
+    """提取需随历史保留的本地命令输出，排除 ``/branch`` 会话指针。
+
+    普通 local-command stdout 可能是后续推理证据，故继续放入 Tool_invocation；
+    ``/branch`` 输出只描述 CC 新旧 session UUID，既不是工具结果，也不影响任务语义。
+    若把它持久化，每次 fork 都会向长工具历史追加一份无用且不稳定的控制信息。
+    """
     parts = []
     for pat in (
         r"(?is)<local-command-caveat>.*?</local-command-caveat>",
         r"(?is)<local-command-stdout>.*?</local-command-stdout>",
     ):
         for m in re.finditer(pat, text):
-            parts.append(m.group(0).strip())
+            block = m.group(0).strip()
+            # ``/branch`` 打印的是供 CC TUI 返回新旧会话的 session 指针，不是任务证据；
+            # 若放进 Tool_invocation，每次分支都会向长历史追加一组无语义且不稳定的 UUID。
+            if re.search(
+                r"(?is)<local-command-stdout>\s*Branched conversation\.\s*"
+                r"You are now in the new branch\b",
+                block,
+            ):
+                continue
+            parts.append(block)
     return "\n\n".join(parts)
 
 
@@ -452,15 +468,29 @@ def _empty_agent_lifecycle() -> dict[str, list[dict[str, Any]]]:
     }
 
 
-def _legacy_user_notification_blocks(
+def _user_notification_blocks(
     message: dict[str, Any],
-) -> list[tuple[int, str]]:
-    """返回可能承载旧式后台通知的 user text blocks。"""
+) -> list[tuple[int | None, str]]:
+    """返回 CC 后台通知候选；``None`` 表示整条 string user 消息。
+
+    CC 首次投递使用 ephemeral text block，下一枪会把同一伪 user 消息携带为
+    plain string。string 形态只收完整的 ``<system-reminder>`` 包装，避免把
+    普通用户正文中引用的一小段通知当成控制消息。
+    """
     content = message.get("content")
+    if isinstance(content, str):
+        stripped = content.strip()
+        if (
+            re.fullmatch(r"(?is)<system-reminder\b[^>]*>.*</system-reminder>", stripped)
+            and _AGENT_NOTIFICATION_HEADER in stripped
+            and "<task-notification" in stripped.lower()
+        ):
+            return [(None, content)]
+        return []
     if not isinstance(content, list):
         return []
 
-    candidates: list[tuple[int, str]] = []
+    candidates: list[tuple[int | None, str]] = []
     is_mixed_message = len(content) > 1
     for block_index, block in enumerate(content):
         if not isinstance(block, dict) or block.get("type") != "text":
@@ -475,7 +505,7 @@ def _legacy_user_notification_blocks(
         text = block.get("text")
         if (
             not isinstance(text, str)
-            or not text.lstrip().startswith(_AGENT_NOTIFICATION_HEADER)
+            or _AGENT_NOTIFICATION_HEADER not in text
             or "<task-notification" not in text.lower()
         ):
             continue
@@ -493,14 +523,25 @@ def _assistant_has_tool_use(message: dict[str, Any]) -> bool:
 
 def _agent_lifecycle_context(
     messages: list,
-) -> tuple[dict[str, list[dict[str, Any]]], dict[int, dict[int, str]]]:
-    """返回生命周期与须从 user 正文提升的旧式通知 blocks。"""
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[int, dict[int | None, str]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """返回生命周期、须提升的通知 blocks、可信通知摘要与 Agent 调用。
+
+    只有能和已有 Agent tool-use-id 配对的通知才被提升出 user 正文；这样
+    Claude Code 的控制通知不会被当作用户话语，同时用户粘贴的仿造 XML 也不会
+    获得系统输入权限。
+    """
     lifecycle = _empty_agent_lifecycle()
-    legacy_notifications: dict[int, dict[int, str]] = {}
+    promoted_notifications: dict[int, dict[int | None, str]] = {}
     if not isinstance(messages, list) or not messages:
-        return lifecycle, legacy_notifications
+        return lifecycle, promoted_notifications, [], []
 
     agent_calls: dict[str, dict[str, Any]] = {}
+    agent_call_summaries: list[dict[str, Any]] = []
     assistant_tool_indices: dict[str, int] = {}
     for message_index, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -522,13 +563,20 @@ def _agent_lifecycle_context(
             description = agent_input.get("description") or ""
             if not isinstance(description, str):
                 description = str(description)
+            agent_call_summaries.append(
+                {
+                    "tool_use_id": tool_use_id,
+                    "description": description.strip(),
+                    "message_index": message_index,
+                }
+            )
             agent_calls[tool_use_id] = {
                 "description": description.strip(),
                 "call_index": message_index,
             }
 
     if not agent_calls:
-        return lifecycle, legacy_notifications
+        return lifecycle, promoted_notifications, [], agent_call_summaries
 
     async_launches: dict[str, int] = {}
     for message_index, message in enumerate(messages):
@@ -565,7 +613,7 @@ def _agent_lifecycle_context(
                 else []
             )
         elif role == "user":
-            notification_candidates = list(_legacy_user_notification_blocks(message))
+            notification_candidates = list(_user_notification_blocks(message))
         else:
             continue
 
@@ -580,14 +628,21 @@ def _agent_lifecycle_context(
                 if not call or message_index <= int(call["call_index"]):
                     continue
                 status = _notification_tag(notification_text, "status")
+                # tool-use-id 与消息链中真实 Agent 调用配对，决定通知能否提升为
+                # 系统输入；task-id 只用于和 SubagentStart/Stop 档案关联，不能
+                # 单独授予身份、会话 CID 或控制消息权限。
                 notifications[tool_use_id] = {
+                    "tool_use_id": tool_use_id,
+                    "agent_id": _notification_tag(notification_text, "task-id"),
                     "status": status,
                     "message_index": message_index,
                     "has_result": bool(_notification_tag(notification_text, "result")),
+                    "summary": _notification_tag(notification_text, "summary"),
+                    "result": _notification_tag(notification_text, "result"),
                 }
                 matched_agent = True
-            if block_index is not None and matched_agent:
-                legacy_notifications.setdefault(message_index, {})[
+            if role == "user" and matched_agent:
+                promoted_notifications.setdefault(message_index, {})[
                     block_index
                 ] = notification_message
 
@@ -629,6 +684,7 @@ def _agent_lifecycle_context(
                 break
         item = {
             "tool_use_id": tool_use_id,
+            "agent_id": notification.get("agent_id") or "",
             "description": call["description"],
             "status": notification["status"],
             "message_index": notification_index,
@@ -639,12 +695,21 @@ def _agent_lifecycle_context(
         elif not any(i > notification_index for i in assistant_message_indices):
             lifecycle["result_ready"].append(item)
 
-    return lifecycle, legacy_notifications
+    trusted_notifications = sorted(
+        (dict(item) for item in notifications.values()),
+        key=lambda item: int(item.get("message_index") or 0),
+    )
+    return (
+        lifecycle,
+        promoted_notifications,
+        trusted_notifications,
+        agent_call_summaries,
+    )
 
 
 def extract_agent_lifecycle(messages: list) -> dict[str, list[dict[str, Any]]]:
-    """从完整 CC 消息链重建后台 Agent 的当前阶段，不保存跨请求状态。"""
-    lifecycle, _legacy_notifications = _agent_lifecycle_context(messages)
+    """兼容调用面：返回消息链中的 Agent 生命周期。"""
+    lifecycle, _promoted, _trusted, _calls = _agent_lifecycle_context(messages)
     return lifecycle
 
 
@@ -702,7 +767,7 @@ def _latest_full_file_states(
             body = str(result.get("content") or "")
             if inp.get("offset") is not None or inp.get("limit") is not None:
                 continue
-            if "Wasted call" in body[:500] or "file unchanged since your last Read" in body[:500]:
+            if _is_wasted_read_body(body):
                 continue
         latest[normalize_path(path)] = {
             "id": tid,
@@ -713,8 +778,66 @@ def _latest_full_file_states(
     return latest
 
 
+def _is_wasted_read_body(body: str) -> bool:
+    """A Wasted-call response is not a newer snapshot of the requested view."""
+    head = (body or "")[:500]
+    return "Wasted call" in head or "file unchanged since your last Read" in head
+
+
+def _read_view_option(value: Any) -> Any:
+    """Make a Read range option safe and stable as a dictionary key."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _read_view_key(call: dict[str, Any]) -> tuple[str, Any, Any] | None:
+    """Return the exact identity of one Read path/range view."""
+    path = normalize_path(str(call.get("path") or ""))
+    if not path:
+        return None
+    inp = call.get("input") or {}
+    return (
+        path,
+        _read_view_option(inp.get("offset")),
+        _read_view_option(inp.get("limit")),
+    )
+
+
+def _latest_read_views(
+    calls: dict[str, dict[str, Any]], results: dict[str, dict[str, Any]]
+) -> dict[tuple[str, Any, Any], dict[str, Any]]:
+    """Find the latest successful result for every exact path/range Read view."""
+    latest: dict[tuple[str, Any, Any], dict[str, Any]] = {}
+    for tid, result in sorted(results.items(), key=lambda item: item[1]["order"]):
+        call = calls.get(tid) or {}
+        if str(call.get("name") or "").lower() != "read":
+            continue
+        body = str(result.get("content") or "")
+        if result.get("is_error") or not body or _is_wasted_read_body(body):
+            continue
+        key = _read_view_key(call)
+        if key is None:
+            continue
+        inp = call.get("input") or {}
+        latest[key] = {
+            "id": tid,
+            "name": call.get("name") or "Read",
+            "path": call.get("path") or "",
+            "offset": inp.get("offset"),
+            "limit": inp.get("limit"),
+            "order": result["order"],
+        }
+    return latest
+
+
 def _superseded_note(latest: dict[str, Any]) -> str:
-    return "(superseded file state; latest={} id={} path={})".format(
+    label = latest.get("label") or "file state"
+    return "(superseded {}; latest={} id={} path={})".format(
+        label,
         latest.get("name") or "?", latest.get("id") or "?", latest.get("path") or "?"
     )
 
@@ -747,6 +870,7 @@ def _extract_tool_blocks_from_messages(
     """工具原文的唯一载体；当前结果在 query，旧快照按最新文件状态折叠。"""
     calls, results = _tool_trace_index(messages)
     latest_states = _latest_full_file_states(calls, results)
+    latest_views = _latest_read_views(calls, results)
     external_order = max(
         [int(x.get("order") or 0) for x in calls.values()]
         + [int(x.get("order") or 0) for x in results.values()]
@@ -794,18 +918,39 @@ def _extract_tool_blocks_from_messages(
                 elif btype == "tool_result":
                     tid = str(b.get("tool_use_id") or b.get("id") or "")
                     call = calls.get(tid) or {}
-                    latest = latest_states.get(normalize_path(str(call.get("path") or "")))
                     body = text_from_content(b.get("content"))
                     if tid in current_ids:
                         body = "(current result carried in sys.query)"
-                    elif (
-                        str(call.get("name") or "").lower() == "read"
-                        and latest
-                        and latest.get("id") != tid
-                        and int(latest.get("order") or 0)
-                        > int((results.get(tid) or {}).get("order") or 0)
-                    ):
-                        body = _superseded_note(latest)
+                    elif str(call.get("name") or "").lower() == "read":
+                        result_order = int((results.get(tid) or {}).get("order") or 0)
+                        candidates: list[dict[str, Any]] = []
+                        latest = latest_states.get(
+                            normalize_path(str(call.get("path") or ""))
+                        )
+                        if (
+                            latest
+                            and latest.get("id") != tid
+                            and int(latest.get("order") or 0) > result_order
+                        ):
+                            file_state = dict(latest)
+                            file_state["label"] = "file state"
+                            candidates.append(file_state)
+                        view = latest_views.get(_read_view_key(call))
+                        if (
+                            view
+                            and view.get("id") != tid
+                            and int(view.get("order") or 0) > result_order
+                        ):
+                            read_view = dict(view)
+                            read_view["label"] = "read view"
+                            candidates.append(read_view)
+                        if candidates:
+                            body = _superseded_note(
+                                max(
+                                    candidates,
+                                    key=lambda item: int(item.get("order") or 0),
+                                )
+                            )
                     parts.append(
                         TOOL_RESULT_LINE_FMT.format(
                             tid,
@@ -825,6 +970,42 @@ def _extract_tool_blocks_from_messages(
 
 _SYSTEM_REMINDER_RE = re.compile(r"(?is)<system-reminder>.*?</system-reminder>")
 
+# CC 把本地命令序列化为三个 XML 元素。这里匹配完整元素而非只匹配标签，
+# 以免命令名和参数漏进下一轮；是否真正删除仍由下方函数限定为 ``/branch``。
+_COMMAND_SHELL_BLOCK_RE = re.compile(
+    r"(?is)"
+    r"<command-name\b[^>]*>.*?</command-name>"
+    r"|<command-message\b[^>]*>.*?</command-message>"
+    r"|<command-args\b[^>]*>.*?</command-args>"
+)
+
+
+def _strip_branch_command_shell(text: str) -> str:
+    """只剥除 Claude Code ``/branch`` 包络，保留同轮真实用户文字。
+
+    CC 会把 ``command-*`` 三块与用户紧随其后的输入合并为同一条 user message；
+    事故请求因此同时含 ``/branch`` 控制壳和「继续」。模型只应收到后者。
+    这里同时校验 command-name 与 command-message，未知/自定义 slash command
+    一律原样放行，避免代理替 Claude Code 猜测其是否属于模型任务。
+    """
+    if not text:
+        return ""
+    name = re.search(
+        r"(?is)<command-name\b[^>]*>\s*(.*?)\s*</command-name>", text
+    )
+    message = re.search(
+        r"(?is)<command-message\b[^>]*>\s*(.*?)\s*</command-message>", text
+    )
+    # 同时核对两个字段和精确的内建命令；自定义 slash command 可能就是模型任务，
+    # 因而必须 fail-open、原样保留。
+    if not name or not message:
+        return text
+    if name.group(1).lstrip("/").casefold() != "branch":
+        return text
+    if message.group(1).lstrip("/").casefold() != "branch":
+        return text
+    return _COMMAND_SHELL_BLOCK_RE.sub("", text)
+
 
 def strip_reminders(text: str) -> str:
     """剥除 <system-reminder> 块（plan 的指纹判定与此处折叠共用）。"""
@@ -834,10 +1015,23 @@ def strip_reminders(text: str) -> str:
 def _user_query_after_reminders(user_text: str) -> str:
     if not user_text:
         return ""
-    without = strip_reminders(user_text)
+    # 可信 Agent 通知已在 parse_payload 中从 conversation_messages 移走；仍留在
+    # 用户正文里的同形 XML 没有匹配真实 Agent call，必须保留为普通用户文字。
+    def remove_context_reminder(match: re.Match[str]) -> str:
+        block = match.group(0)
+        if (
+            _AGENT_NOTIFICATION_HEADER in block
+            and "<task-notification" in block.lower()
+        ):
+            return block
+        return ""
+
+    without = _SYSTEM_REMINDER_RE.sub(remove_context_reminder, user_text)
     without = re.sub(r"(?is)<local-command-caveat>.*?</local-command-caveat>", "", without)
     without = re.sub(r"(?is)<local-command-stdout>.*?</local-command-stdout>", "", without)
-    return without.strip()
+    # branch 创建新的 CC session，XML 包络属于控制信息；与它同轮出现的剩余文字
+    # （通常是「继续」）才是真正的用户请求。
+    return _strip_branch_command_shell(without).strip()
 
 
 def _assistant_for_history(content: Any) -> str:
@@ -1012,14 +1206,21 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         messages = []
-    agent_lifecycle, legacy_agent_notifications = _agent_lifecycle_context(messages)
+    (
+        agent_lifecycle,
+        promoted_agent_notifications,
+        trusted_agent_notifications,
+        agent_calls,
+    ) = _agent_lifecycle_context(messages)
     conversation_messages: list[Any] = []
     for message_index, message in enumerate(messages):
-        notification_blocks = legacy_agent_notifications.get(message_index)
+        notification_blocks = promoted_agent_notifications.get(message_index)
         if not notification_blocks or not isinstance(message, dict):
             conversation_messages.append(message)
             continue
         content = message.get("content")
+        if isinstance(content, str) and None in notification_blocks:
+            continue
         if not isinstance(content, list):
             conversation_messages.append(message)
             continue
@@ -1045,7 +1246,7 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
     for message_index, m in enumerate(messages):
         if not isinstance(m, dict):
             continue
-        notification_blocks = legacy_agent_notifications.get(message_index)
+        notification_blocks = promoted_agent_notifications.get(message_index)
         if notification_blocks:
             message_texts = [
                 notification_blocks[block_index]
@@ -1070,7 +1271,10 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
             else:
                 system_msg_parts.append(text)
     if system_msg_parts:
-        inputs["System_Description"] = "\n\n".join(system_msg_parts).strip()
+        # 同一通知可能在 CC 序列化转换处以等值载体重现；系统说明只保留一份。
+        inputs["System_Description"] = "\n\n".join(
+            dict.fromkeys(part.strip() for part in system_msg_parts if part.strip())
+        ).strip()
     if current_context_parts:
         inputs["Current_Context"] = "\n\n".join(current_context_parts).strip()
 
@@ -1114,8 +1318,8 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
     notes.append("current_context_parts={}".format(len(current_context_parts)))
     notes.append("current_context_full_reads={}".format(len(current_full_read_paths)))
     notes.append(
-        "agent_legacy_notifications={}".format(
-            sum(len(blocks) for blocks in legacy_agent_notifications.values())
+        "agent_promoted_notifications={}".format(
+            sum(len(blocks) for blocks in promoted_agent_notifications.values())
         )
     )
     notes.extend(
@@ -1144,6 +1348,8 @@ def parse_payload(body: dict[str, Any]) -> dict[str, Any]:
         "conversation_messages": conversation_messages,
         "current_user": current,
         "agent_lifecycle": agent_lifecycle,
+        "agent_notifications": trusted_agent_notifications,
+        "agent_calls": agent_calls,
     }
 
 

@@ -11,9 +11,12 @@ import json
 from pathlib import Path
 
 import httpx
+from fastapi.testclient import TestClient
 
 from answer import build_non_stream_message, build_non_stream_with_tools
 from dify import DifyInputLimits
+from log import read_transport_trace
+from main import TracedStreamingResponse
 from parse import (
     INPUT_KEYS,
     extract_images_from_content,
@@ -391,12 +394,12 @@ async def _run_incident_shard_case(main, monkeypatch) -> None:
     assert response.status_code == 200
     assert len(captured) == 1
     sent = captured[0]["inputs"]
-    assert sent["Tool_invocation"] == ""
-    assert incident_text in sent["Tool_invocation_1"] + sent["Tool_invocation_2"]
+    assert sent["Tool_invocation"]
+    assert incident_text in sent["Tool_invocation"] + sent["Tool_invocation_1"]
     assert "[[cc_input_shards:on]]" in captured[0]["query"]
     assert all(
         len(sent[key]) < len(incident_text)
-        for key in ("Tool_invocation_1", "Tool_invocation_2")
+        for key in ("Tool_invocation", "Tool_invocation_1")
     )
     assert main.meter.snapshot()["opus_calls"] == 1
 
@@ -540,3 +543,101 @@ async def _run_detach_case(main, monkeypatch, tmp_path: Path) -> None:
     # 上游侧的完成事实与交付事实分开记录，不可合并判断
     assert summary["response"]["stop_reason"] == "end_turn"
     assert summary["response"]["empty_upstream"] is False
+
+
+def test_stream_transport_trace_separates_upstream_and_downstream_completion(
+    isolated_main, monkeypatch, tmp_path: Path
+):
+    main = isolated_main(log_requests=True)
+    log_dir = tmp_path / "transport-logs"
+    monkeypatch.setattr(main, "LOG_DIR", log_dir)
+
+    def fake_stream_chat_messages(**kwargs):
+        observe = kwargs.get("on_transport_event")
+
+        async def events():
+            if observe:
+                observe("dify_response_headers", {"status_code": 200})
+                observe("dify_first_event", {"event_type": "message"})
+            yield {"event": "message", "answer": "可观测正文"}
+            if observe:
+                observe(
+                    "dify_terminal_event",
+                    {"event_type": "message_end", "event_index": 2},
+                )
+            yield {"event": "message_end"}
+            if observe:
+                observe(
+                    "dify_stream_closed",
+                    {
+                        "completed": True,
+                        "parsed_events": 2,
+                        "yielded_events": 2,
+                        "last_event": "message_end",
+                        "terminal_event_seen": "message_end",
+                    },
+                )
+
+        return events()
+
+    monkeypatch.setattr(main, "stream_chat_messages", fake_stream_chat_messages)
+    body = {
+        "model": "alan",
+        "stream": True,
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [{"role": "user", "content": "观察传输"}],
+    }
+    with TestClient(main.app) as client:
+        response = client.post("/v1/messages", json=body, headers=_HEADERS)
+
+    assert response.status_code == 200
+    request_logs = sorted(
+        path for path in log_dir.glob("*.json") if path.name != "last_request.json"
+    )
+    assert len(request_logs) == 1
+    rows = read_transport_trace(request_logs[0].with_suffix(".trace.jsonl"), limit=200)
+    names = [row["event"] for row in rows]
+    assert "dify_terminal_event" in names
+    assert "downstream_stream_generated_complete" in names
+    assert any(
+        row["event"] == "downstream_send_attempt"
+        and "message_stop" in row.get("event_types", [])
+        for row in rows
+    )
+    finished = next(row for row in rows if row["event"] == "downstream_response_finished")
+    assert finished["completed"] is True
+    summary = json.loads(request_logs[0].read_text(encoding="utf-8"))["summary"]
+    assert summary["delivery_status"] == "stream_complete"
+
+
+def test_traced_streaming_response_records_message_stop_write_failure():
+    trace: list[tuple[str, dict]] = []
+
+    async def content():
+        yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+        yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    response = TracedStreamingResponse(
+        content(),
+        trace=lambda event, **fields: trace.append((event, fields)),
+        media_type="text/event-stream",
+    )
+
+    async def send(message):
+        body = message.get("body") or b""
+        if b"event: message_stop" in body:
+            raise OSError("client socket closed")
+
+    async def run() -> None:
+        try:
+            await response.stream_response(send)
+        except OSError:
+            pass
+
+    asyncio.run(run())
+    names = [name for name, _fields in trace]
+    assert "downstream_message_start_sent" in names
+    assert "downstream_message_stop_send_attempt" in names
+    assert "downstream_message_stop_send_error" in names
+    finished = next(fields for name, fields in trace if name == "downstream_response_finished")
+    assert finished["completed"] is False

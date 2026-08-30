@@ -60,7 +60,6 @@ class UsageMeter:
             "other_calls": 0,
             "opus_usd_per_call": _fenv("OPUS_USD_PER_CALL", DEFAULT_OPUS_USD),
             "haiku_usd_per_call": _fenv("HAIKU_USD_PER_CALL", DEFAULT_HAIKU_USD),
-            "estimated_usd": 0.0,
             "by_kind": {},
             "last": None,
         }
@@ -81,6 +80,8 @@ class UsageMeter:
     ) -> dict[str, Any]:
         with self._lock:
             data = self._read()
+            # API 输出仍含 estimated_usd；落盘只保留计算它所需的次数与单价。
+            data.pop("estimated_usd", None)
             opus_unit = _fenv(
                 "OPUS_USD_PER_CALL",
                 _stored_float(data, "opus_usd_per_call", DEFAULT_OPUS_USD),
@@ -103,12 +104,6 @@ class UsageMeter:
             else:
                 data["other_calls"] = int(data.get("other_calls") or 0) + 1
 
-            data["estimated_usd"] = _estimated_usd(
-                int(data.get("opus_calls") or 0),
-                int(data.get("haiku_calls") or 0),
-                opus_unit,
-                haiku_unit,
-            )
             by = data.get("by_kind")
             if not isinstance(by, dict):
                 by = {}

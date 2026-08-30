@@ -127,6 +127,83 @@ async def _run_parameter_cache_case() -> None:
     assert calls == 3
 
 
+def test_stream_chat_messages_reports_wire_lifecycle_without_payload(monkeypatch):
+    seen: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b"event: ping\n\n"
+                b'data: {"event":"message","answer":"hi"}\n\n'
+                b'data: {"event":"message_end"}'
+            ),
+        )
+
+    async def run() -> list[dict]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            events = []
+            async for event in dify.stream_chat_messages(
+                base_url="https://example.test/v1",
+                api_key="app-test",
+                user="u",
+                query="q",
+                conversation_id=None,
+                client=client,
+                on_transport_event=lambda name, fields: seen.append((name, fields)),
+            ):
+                events.append(event)
+            return events
+
+    events = asyncio.run(run())
+    assert [event["event"] for event in events] == ["message", "message_end"]
+    names = [name for name, _fields in seen]
+    assert names[0] == "dify_request_open"
+    assert "dify_response_headers" in names
+    assert "dify_first_event" in names
+    assert "dify_terminal_event" in names
+    closed = next(fields for name, fields in seen if name == "dify_stream_closed")
+    assert closed["completed"] is True
+    assert closed["ping_lines"] == 1
+    assert closed["terminal_event_seen"] == "message_end"
+
+
+def test_stream_chat_messages_reports_upstream_disconnect_and_reraises():
+    seen: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=b'data: {"event":"message","answer":"partial"}\n\n',
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            stream = dify.stream_chat_messages(
+                base_url="https://example.test/v1",
+                api_key="app-test",
+                user="u",
+                query="q",
+                conversation_id=None,
+                client=client,
+                on_transport_event=lambda name, fields: seen.append((name, fields)),
+            )
+            first = await anext(stream)
+            assert first["event"] == "message"
+            await stream.aclose()
+
+    asyncio.run(run())
+    names = [name for name, _fields in seen]
+    assert "dify_stream_cancelled" in names
+    closed = next(fields for name, fields in seen if name == "dify_stream_closed")
+    assert closed["completed"] is False
+    assert closed["terminal_event_seen"] == ""
+
+
 def test_image_upload_mapping_preserves_failed_and_deduped_source_indexes(monkeypatch):
     async def fake_upload(**kwargs):
         if kwargs["b64_data"] == bad:

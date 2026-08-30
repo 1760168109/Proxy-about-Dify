@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import os
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,76 @@ def _captured_at() -> str:
     """微秒级 ISO。不用 persist.utc_now()——它是秒级，而这个值被
     patch_request_log 当作「同一份日志」的判据，同一秒内的两枪会撞成一份。"""
     return datetime.now(timezone.utc).isoformat()
+
+
+def transport_trace_path(request_log_path: Path) -> Path:
+    """请求 JSON 对应的追加式传输轨迹文件。"""
+    return Path(request_log_path).with_suffix(".trace.jsonl")
+
+
+def append_transport_trace(
+    request_log_path: Path | None,
+    *,
+    request_id: str,
+    sequence: int,
+    event: str,
+    elapsed_seconds: float,
+    fields: dict[str, Any] | None = None,
+    durable: bool = False,
+) -> Path | None:
+    """追加一条不含正文的传输生命周期记录。
+
+    与主请求 JSON 的原子重写不同，这里每条记录独立追加并刷盘。即使进程在最终
+    ``finally`` 前被终止，已经发生的边界事件仍可用于还原断点。
+    """
+    if request_log_path is None:
+        return None
+    try:
+        path = transport_trace_path(Path(request_log_path))
+        record: dict[str, Any] = {
+            "at": _captured_at(),
+            "request_id": str(request_id or ""),
+            "sequence": int(sequence),
+            "event": str(event or "unknown"),
+            "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
+            "pid": os.getpid(),
+        }
+        if fields:
+            record.update(fields)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            stream.write("\n")
+            stream.flush()
+            # Most chunks are intentionally only flushed: fsync per token would turn
+            # a long reasoning stream into thousands of synchronous disk stalls. Key
+            # boundary events opt into durable persistence so abrupt termination still
+            # leaves the useful diagnosis on disk.
+            if durable:
+                os.fsync(stream.fileno())
+        return path
+    except Exception as exc:
+        print("[lan] transport trace failed: {}".format(exc))
+        return None
+
+
+def read_transport_trace(path: Path, *, limit: int = 40) -> list[dict[str, Any]]:
+    """读取轨迹尾部；忽略强制终止留下的残缺末行。"""
+    if limit <= 0:
+        return []
+    try:
+        tail: deque[dict[str, Any]] = deque(maxlen=int(limit))
+        with Path(path).open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    tail.append(item)
+        return list(tail)
+    except OSError:
+        return []
 
 
 def summarize_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -112,6 +184,10 @@ def prune_logs(log_dir: Path, keep: int = LOG_KEEP_FILES) -> int:
             removed += 1
         except OSError:
             pass
+        try:
+            transport_trace_path(stale).unlink()
+        except OSError:
+            pass
     return removed
 
 
@@ -135,6 +211,8 @@ def write_request_log(
         summary.update(extra)
     suffix = (request_id or "").strip() or "req_{}".format(_utc_stamp()[-12:-1])
     path = log_dir / "{}_{}_{}.json".format(_utc_stamp(), kind or "chat", suffix)
+    summary.setdefault("request_log_file", path.name)
+    summary.setdefault("transport_trace_file", transport_trace_path(path).name)
     payload: dict[str, Any] = {
         "captured_at": _captured_at(),
         "summary": summary,

@@ -16,6 +16,7 @@ import httpx
 from parse import image_b64_byte_len
 
 OnAccepted = Callable[[], None] | Callable[[], Awaitable[None]]
+OnTransportEvent = Callable[[str, dict[str, Any]], None]
 
 UPLOAD_RETRIES = 3
 _RETRY_BASE_DELAY = 0.45
@@ -182,21 +183,38 @@ _MEDIA_EXT = {
 }
 
 
-def parse_sse_lines(buffer: str) -> tuple[list[dict[str, Any]], str]:
-    """从缓冲切出完整 data: 行；返回 (events, rest)。"""
+def parse_sse_lines(
+    buffer: str, *, stats: dict[str, int] | None = None
+) -> tuple[list[dict[str, Any]], str]:
+    """从缓冲切出完整的单行 ``data:`` JSON；返回 ``(events, rest)``。
+
+    这里只做线缆拆分，不实现完整 SSE 事件组装：``event:`` 头、跨多行的
+    ``data:``、空 data、``[DONE]`` 和非 JSON 行不会被绑定到下一条消息。事件
+    语义与 answer 增量的累加由 ``answer.py`` 的消费者负责。
+    """
     events: list[dict[str, Any]] = []
     segments = buffer.split("\n")
     rest = segments.pop() if segments else ""
     for raw in segments:
         line = raw.replace("\r", "").strip()
+        if stats is not None:
+            stats["wire_lines"] = stats.get("wire_lines", 0) + 1
+            if line.startswith("event: ping"):
+                stats["ping_lines"] = stats.get("ping_lines", 0) + 1
         if not line.startswith("data:"):
+            if stats is not None:
+                stats["ignored_lines"] = stats.get("ignored_lines", 0) + 1
             continue
         payload = line[5:].strip()
         if not payload or payload == "[DONE]":
+            if stats is not None:
+                stats["empty_data_lines"] = stats.get("empty_data_lines", 0) + 1
             continue
         try:
             obj = json.loads(payload)
         except json.JSONDecodeError:
+            if stats is not None:
+                stats["malformed_data_lines"] = stats.get("malformed_data_lines", 0) + 1
             continue
         if isinstance(obj, dict):
             events.append(obj)
@@ -214,10 +232,15 @@ async def stream_chat_messages(
     inputs: dict[str, Any] | None = None,
     files: list[dict[str, Any]] | None = None,
     on_accepted: OnAccepted | None = None,
+    on_transport_event: OnTransportEvent | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """流式 POST /chat-messages；yield 解析后的事件 dict。
+    """流式 POST /chat-messages；逐个 yield 解析后的原始事件 dict。
 
-    on_accepted：HTTP <400 接受流后回调一次（按次计费的「真正传入」时点）。
+    ``on_accepted``：上游 HTTP 状态小于 400、响应流已被接受后回调一次；这只
+    表示 Dify 已开始处理，尚不表示收到正文或完成下游交付（调用方可在这里计费）。
+    on_transport_event：只报告线缆/事件类型、计数与异常摘要，不含 SSE data 正文。
+    其中 ``dify_event_yielded`` 仅表示事件已交给下游转译器，不表示已送达 Claude Code；
+    ``completed``（在关闭事件中）只表示上游迭代到了 EOF，不表示业务工作流成功。
     """
     url = base_url.rstrip("/") + "/chat-messages"
     clean_inputs: dict[str, str] = {}
@@ -239,39 +262,133 @@ async def stream_chat_messages(
         "Content-Type": "application/json",
     }
 
-    async with client.stream("POST", url, headers=headers, json=body) as resp:
-        if resp.status_code >= 400:
-            err_text = await resp.aread()
-            try:
-                err_obj = json.loads(err_text.decode("utf-8", errors="replace"))
-                msg = err_obj.get("message") or err_obj.get("error") or err_text.decode(
-                    "utf-8", errors="replace"
-                )
-            except Exception:
-                msg = err_text.decode("utf-8", errors="replace")
-            raise httpx.HTTPStatusError(
-                "Dify error: {}".format(msg), request=resp.request, response=resp
+    def observe(event: str, **fields: Any) -> None:
+        if on_transport_event is None:
+            return
+        try:
+            on_transport_event(event, fields)
+        except Exception as exc:
+            print("[lan] transport observer failed open: {!r}".format(exc))
+
+    started = time.monotonic()
+    chunks = 0
+    wire_chars = 0
+    parsed_events = 0
+    yielded_events = 0
+    parse_stats: dict[str, int] = {}
+    last_event = ""
+    terminal_event_seen = ""
+    completed = False
+    accepted = False
+
+    def record_yielded_event(event: dict[str, Any]) -> dict[str, Any]:
+        nonlocal parsed_events, yielded_events, last_event, terminal_event_seen
+        parsed_events += 1
+        last_event = str(event.get("event") or "unknown")
+        if parsed_events == 1:
+            observe("dify_first_event", event_type=last_event)
+        if last_event in ("message_end", "workflow_finished", "error"):
+            terminal_event_seen = last_event
+            observe(
+                "dify_terminal_event",
+                event_type=last_event,
+                event_index=parsed_events,
             )
+        yielded_events += 1
+        observe(
+            "dify_event_yielded",
+            event_type=last_event,
+            event_index=yielded_events,
+        )
+        return event
 
-        if on_accepted is not None:
-            try:
-                maybe = on_accepted()
-                if maybe is not None and hasattr(maybe, "__await__"):
-                    await maybe  # type: ignore[misc]
-            except Exception as exc:
-                # Dify 已接受请求；账本等本地旁路故障不能丢掉已生成的答复。
-                print("[lan] on_accepted side effect failed open: {!r}".format(exc))
+    observe("dify_request_open", method="POST", path="/chat-messages")
+    try:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            observe(
+                "dify_response_headers",
+                status_code=resp.status_code,
+                http_version=resp.http_version,
+                content_type=resp.headers.get("content-type") or "",
+            )
+            if resp.status_code >= 400:
+                err_text = await resp.aread()
+                try:
+                    err_obj = json.loads(err_text.decode("utf-8", errors="replace"))
+                    msg = (
+                        err_obj.get("message")
+                        or err_obj.get("error")
+                        or err_text.decode("utf-8", errors="replace")
+                    )
+                except Exception:
+                    msg = err_text.decode("utf-8", errors="replace")
+                raise httpx.HTTPStatusError(
+                    "Dify error: {}".format(msg), request=resp.request, response=resp
+                )
 
-        buffer = ""
-        async for chunk in resp.aiter_text():
-            buffer += chunk
-            events, buffer = parse_sse_lines(buffer)
-            for ev in events:
-                yield ev
-        if buffer.strip():
-            events, _ = parse_sse_lines(buffer + "\n")
-            for ev in events:
-                yield ev
+            if on_accepted is not None:
+                try:
+                    maybe = on_accepted()
+                    if maybe is not None and hasattr(maybe, "__await__"):
+                        await maybe  # type: ignore[misc]
+                except Exception as exc:
+                    # Dify 已接受请求；账本等本地旁路故障不能丢掉已生成的答复。
+                    print("[lan] on_accepted side effect failed open: {!r}".format(exc))
+            accepted = True
+            observe("dify_request_accepted", status_code=resp.status_code)
+
+            buffer = ""
+            first_chunk = True
+            async for chunk in resp.aiter_text():
+                chunks += 1
+                wire_chars += len(chunk)
+                if first_chunk:
+                    first_chunk = False
+                    observe(
+                        "dify_first_byte",
+                        chunk_chars=len(chunk),
+                        upstream_elapsed_seconds=round(time.monotonic() - started, 3),
+                    )
+                buffer += chunk
+                events, buffer = parse_sse_lines(buffer, stats=parse_stats)
+                for ev in events:
+                    yield record_yielded_event(ev)
+            if buffer.strip():
+                events, _ = parse_sse_lines(buffer + "\n", stats=parse_stats)
+                for ev in events:
+                    yield record_yielded_event(ev)
+            completed = True
+    except BaseException as exc:
+        observe(
+            "dify_stream_cancelled"
+            if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+            else "dify_stream_error",
+            exception_type=type(exc).__name__,
+            exception_message=str(exc).strip()[:400],
+            chunks=chunks,
+            wire_chars=wire_chars,
+            parsed_events=parsed_events,
+            yielded_events=yielded_events,
+            **parse_stats,
+            last_event=last_event,
+            terminal_event_seen=terminal_event_seen,
+        )
+        raise
+    finally:
+        observe(
+            "dify_stream_closed",
+            completed=completed,
+            accepted=accepted,
+            chunks=chunks,
+            wire_chars=wire_chars,
+            parsed_events=parsed_events,
+            yielded_events=yielded_events,
+            **parse_stats,
+            last_event=last_event,
+            terminal_event_seen=terminal_event_seen,
+            eof_without_terminal=bool(completed and not terminal_event_seen),
+            upstream_elapsed_seconds=round(time.monotonic() - started, 3),
+        )
 
 
 # ── 图片上传 ─────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ def isolated_main(tmp_path, monkeypatch):
         log_requests: bool = False,
     ):
         import main
+        from agent_bridge import AgentBridgeStore
         from cache import ReadCache
         from dify import DifyInputLimits
         from meter import UsageMeter
@@ -43,6 +44,9 @@ def isolated_main(tmp_path, monkeypatch):
             main, "store", session_store or SessionStore(tmp_path / "sessions.json")
         )
         monkeypatch.setattr(main, "meter", UsageMeter(tmp_path / "usage.json"))
+        monkeypatch.setattr(
+            main, "agent_store", AgentBridgeStore(tmp_path / "agents.json")
+        )
         monkeypatch.setattr(
             main, "read_cache", ReadCache(tmp_path / "cache.json", **cache_kwargs)
         )

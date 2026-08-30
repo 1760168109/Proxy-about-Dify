@@ -272,7 +272,13 @@ def _pull_reasoning_from_event(ev: dict[str, Any]) -> str:
 
 
 class DifyStreamAccum:
-    """Dify SSE 事件单源累加器；流式 / 非流共用同一 ingest。"""
+    """Dify SSE 事件单源累加器；流式 / 非流共用同一 ``ingest``。
+
+    ``ingest`` 只累加正文、思考、结构化输出和错误状态；``finalize_parts``
+    才决定最终 Anthropic 形态并尝试提交 conversation id。提交不要求一定见到
+    ``message_end``：只要已有 CID 且没有错误/失败状态，EOF 后 finalize 仍可能
+    写入会话；遇到无终端事件的 EOF 时须结合 Dify transport trace 判断完整性。
+    """
 
     __slots__ = (
         "answer_buf",
@@ -307,7 +313,12 @@ class DifyStreamAccum:
         self, ev: dict[str, Any], *, on_conversation_id=None
     ) -> tuple[str, str, str]:
         """处理单事件 → (kind, reasoning_delta, answer_delta)；
-        kind: error | reasoning | answer | end | other"""
+        kind: error | reasoning | answer | end | other
+
+        ``on_conversation_id`` 保留旧调用面的关键字兼容；CID 只在
+        ``finalize_parts`` 成功收尾时提交，事件摄取阶段不执行 callback。
+        """
+        del on_conversation_id
         self.event_total += 1
         etype = ev.get("event")
         etype_key = str(etype or "unknown")
@@ -350,9 +361,6 @@ class DifyStreamAccum:
             return "other", "", ""
 
         if etype == "message_end":
-            cid2 = ev.get("conversation_id")
-            if isinstance(cid2, str) and cid2:
-                self.last_cid = cid2
             u = extract_dify_usage(ev)
             if u.get("input_tokens"):
                 self.usage["input_tokens"] = u["input_tokens"]
@@ -390,7 +398,11 @@ class DifyStreamAccum:
         return "other", "", ""
 
     def _commit_conversation_id(self, callback) -> None:
-        """只在成功收尾后绑定会话，避免失败枪污染 sessions。"""
+        """在无错误/失败状态的 finalize 阶段绑定会话，避免失败枪污染 sessions。
+
+        这里的“收尾”是累加器 finalize，不是 ``message_end`` 事件本身；Dify
+        若无终端事件却自然 EOF，仍可能提交已有 CID，完整性要看 transport trace。
+        """
         if (
             self.conversation_id_committed
             or not self.last_cid
@@ -868,7 +880,7 @@ async def dify_events_to_anthropic_sse(
 
     try:
         async for ev in events:
-            kind, r_delta, a_delta = accum.ingest(ev, on_conversation_id=on_conversation_id)
+            kind, r_delta, a_delta = accum.ingest(ev)
             if kind == "error":
                 break
             if enable_tools:
@@ -1075,7 +1087,7 @@ async def collect_dify_answer(
     """非流收集；返回 (text, reasoning, tool_uses, usage, parts)。"""
     accum = DifyStreamAccum(input_tokens_hint=input_tokens_hint)
     async for ev in events:
-        kind, _, _ = accum.ingest(ev, on_conversation_id=on_conversation_id)
+        kind, _, _ = accum.ingest(ev)
         if kind == "error":
             raise RuntimeError(str(accum.error or "Dify stream error"))
     parts = accum.finalize_parts(

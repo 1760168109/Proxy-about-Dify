@@ -84,6 +84,22 @@ if (-not (Test-Path $envFile) -and (Test-Path $example)) {
     Write-Host "[lan] Created .env - set DIFY_USER_ID to your own name."
 }
 
+# 子代理身份与完成报告依赖两个 command hook。结构化合并只替换本项目自己的
+# claude_hook.py 项，保留用户已有的其它 hooks / permissions / env。
+$hookScript = Join-Path $proxyDir "claude_hook.py"
+if (Test-Path $hookScript) {
+    $claudeDir = Join-Path $env:USERPROFILE ".claude"
+    $settingsPath = Join-Path $claudeDir "settings.json"
+    if (-not (Test-Path $claudeDir)) {
+        New-Item -ItemType Directory -Path $claudeDir | Out-Null
+    }
+    python $hookScript --install $settingsPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to install Claude Code subagent hooks."
+    }
+    Write-Host "[lan] Claude hooks -> SubagentStart / SubagentStop"
+}
+
 # Optional: point Claude Code statusLine at the local per-call usage script.
 if ($StatusLine) {
     $statusScript = Join-Path $proxyDir "statusline-usage.ps1"

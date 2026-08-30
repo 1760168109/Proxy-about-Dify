@@ -245,10 +245,25 @@ def test_conversation_id_commits_only_after_successful_finalize():
     assert seen == []
 
     successful = DifyStreamAccum()
-    successful.ingest({"event": "message", "conversation_id": "cid-ok", "answer": "done"})
+    successful.ingest(
+        {"event": "message", "conversation_id": "cid-ok", "answer": "done"},
+        on_conversation_id=seen.append,
+    )
+    assert seen == []
     successful.finalize_parts(on_conversation_id=seen.append)
     successful.finalize_parts(on_conversation_id=seen.append)
     assert seen == ["cid-ok"]
+
+    end_only = DifyStreamAccum()
+    end_only.ingest(
+        {
+            "event": "message_end",
+            "conversation_id": "cid-end-only",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+        }
+    )
+    end_only.finalize_parts(on_conversation_id=seen.append)
+    assert seen == ["cid-ok", "cid-end-only"]
 
 
 def test_split_think_and_text():

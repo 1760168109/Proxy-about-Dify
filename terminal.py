@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from parse import text_from_content
-from persist import atomic_write_json, read_json_dict, utc_now
+from persist import atomic_write_json, read_json_dict
 from tools import TERMINAL_TOOL_NAMES, is_terminal_tool_batch
 
 
@@ -298,7 +298,6 @@ class TerminalStore:
             bucket[sid] = {
                 "after_success": text[:8000],
                 "tools": tools,
-                "created_at": utc_now(),
                 "created_epoch": self.clock(),
             }
             self._prune(data)
@@ -402,7 +401,6 @@ class TerminalStore:
                     "after_success": resolution.text[:8000],
                     "tool_ids": list(ids),
                     "tool_names": list(names),
-                    "created_at": utc_now(),
                     "created_epoch": self.clock(),
                 }
             self._write(data)

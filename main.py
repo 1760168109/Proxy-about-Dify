@@ -29,9 +29,21 @@ from answer import (
     estimate_input_tokens_from_request,
     iter_plain_text_sse,
 )
+from agent_bridge import (
+    AgentBridgeStore,
+    extract_and_strip_transport,
+    merge_archived_reports,
+    wants_archived_agent_reports,
+)
 from cache import ReadCache, ingest_messages_into_cache
 from dify import DifyInputLimits, DifyParameterCache, stream_chat_messages
-from log import patch_request_log, response_log_patch, write_request_log
+from log import (
+    append_transport_trace,
+    patch_request_log,
+    read_transport_trace,
+    response_log_patch,
+    write_request_log,
+)
 from meter import UsageMeter
 from outbound import (
     DifyInputLengthError,
@@ -46,6 +58,7 @@ from plan import build_plan
 from protocol import PRIMARY_DISCOVERY_MODEL_ID, discovery_models
 from sessions import SessionStore, extract_cc_session_id
 from singleflight import SingleFlight, request_fingerprint
+from status import build_action_status
 from terminal import TerminalResolution, TerminalStore
 from tools import TERMINAL_TOOL_NAMES
 from unicode_wire import DifyPersistenceSizeError
@@ -71,10 +84,201 @@ NONSTREAM_REPLAY_TTL_SECONDS = 180.0
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+
+def _sse_event_types(payload: bytes | bytearray | memoryview | str) -> list[str]:
+    """只从下游线缆头部提取 event 名；不触碰 data 正文。"""
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        text = bytes(payload).decode("utf-8", errors="replace")
+    else:
+        text = payload
+    result: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            value = line[6:].strip()
+            if value:
+                result.append(value[:80])
+    return result
+
+
+def _trace_chunk(index: int, event_types: list[str]) -> bool:
+    """采样普通分片，完整保留协议边界与异常分片。"""
+    if index <= 12 or index % 25 == 0:
+        return True
+    return any(
+        event_type in {"message_start", "message_delta", "message_stop", "error"}
+        for event_type in event_types
+    )
+
+
+class TracedStreamingResponse(StreamingResponse):
+    """StreamingResponse that records the actual ASGI send boundary.
+
+    The generator can produce a chunk successfully while the socket write fails. This
+    wrapper records both sides without logging SSE data, so a trace can distinguish
+    converter failure from downstream disconnect. A successful ASGI ``send`` only
+    proves that the server transport accepted the chunk; it does not prove that Claude
+    Code parsed, displayed, or persisted it.
+    """
+
+    def __init__(self, content, *, trace=None, **kwargs):
+        self._transport_trace = trace or (lambda *_args, **_kwargs: None)
+        super().__init__(content, **kwargs)
+
+    async def stream_response(self, send) -> None:
+        body_chunks = 0
+        body_bytes = 0
+        completed = False
+
+        async def traced_send(message):
+            nonlocal body_chunks, body_bytes
+            message_type = message.get("type")
+            if message_type == "http.response.start":
+                self._transport_trace(
+                    "downstream_response_start",
+                    _durable=True,
+                    status_code=message.get("status"),
+                )
+            elif message_type == "http.response.body":
+                body_chunks += 1
+                body = message.get("body") or b""
+                if isinstance(body, str):
+                    chunk_bytes = len(body.encode("utf-8"))
+                    event_types = _sse_event_types(body)
+                else:
+                    chunk_bytes = len(body)
+                    event_types = _sse_event_types(body)
+                body_bytes += chunk_bytes
+                is_final_body = not bool(message.get("more_body"))
+                if is_final_body:
+                    self._transport_trace(
+                        "downstream_body_final_send_attempt",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                    )
+                if "message_start" in event_types:
+                    self._transport_trace(
+                        "downstream_message_start_send_attempt",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                    )
+                if "message_stop" in event_types:
+                    self._transport_trace(
+                        "downstream_message_stop_send_attempt",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                    )
+                sampled = _trace_chunk(body_chunks, event_types)
+                if sampled:
+                    self._transport_trace(
+                        "downstream_send_attempt",
+                        body_chunk_index=body_chunks,
+                        body_bytes=chunk_bytes,
+                        more_body=bool(message.get("more_body")),
+                        event_types=event_types,
+                    )
+            try:
+                await send(message)
+            except BaseException as exc:
+                if message_type == "http.response.body":
+                    if "message_start" in event_types:
+                        self._transport_trace(
+                            "downstream_message_start_send_error",
+                            _durable=True,
+                            body_chunk_index=body_chunks,
+                            exception_type=type(exc).__name__,
+                            exception_message=str(exc).strip()[:400],
+                        )
+                    if "message_stop" in event_types:
+                        self._transport_trace(
+                            "downstream_message_stop_send_error",
+                            _durable=True,
+                            body_chunk_index=body_chunks,
+                            exception_type=type(exc).__name__,
+                            exception_message=str(exc).strip()[:400],
+                        )
+                    if is_final_body:
+                        self._transport_trace(
+                            "downstream_body_final_send_error",
+                            _durable=True,
+                            body_chunk_index=body_chunks,
+                            exception_type=type(exc).__name__,
+                            exception_message=str(exc).strip()[:400],
+                        )
+                    self._transport_trace(
+                        "downstream_send_error",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                        body_bytes=len(message.get("body") or b""),
+                        event_types=event_types,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc).strip()[:400],
+                    )
+                else:
+                    self._transport_trace(
+                        "downstream_send_error",
+                        _durable=True,
+                        message_type=message_type,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc).strip()[:400],
+                    )
+                raise
+            else:
+                if message_type == "http.response.body" and "message_start" in event_types:
+                    self._transport_trace(
+                        "downstream_message_start_sent",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                    )
+                if message_type == "http.response.body" and "message_stop" in event_types:
+                    self._transport_trace(
+                        "downstream_message_stop_sent",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                    )
+                if message_type == "http.response.body" and is_final_body:
+                    self._transport_trace(
+                        "downstream_body_final_sent",
+                        _durable=True,
+                        body_chunk_index=body_chunks,
+                    )
+                if message_type == "http.response.body" and sampled:
+                    self._transport_trace(
+                        "downstream_send_ok",
+                        body_chunk_index=body_chunks,
+                        body_bytes=len(message.get("body") or b""),
+                        more_body=bool(message.get("more_body")),
+                        event_types=event_types,
+                    )
+
+        try:
+            await super().stream_response(traced_send)
+            completed = True
+        finally:
+            self._transport_trace(
+                "downstream_response_finished",
+                _durable=True,
+                completed=completed,
+                body_chunks=body_chunks,
+                body_bytes=body_bytes,
+            )
+
+    async def __call__(self, scope, receive, send):
+        try:
+            return await super().__call__(scope, receive, send)
+        except BaseException as exc:
+            self._transport_trace(
+                "downstream_response_error",
+                _durable=True,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc).strip()[:400],
+            )
+            raise
+
 DATA_DIR = ROOT / "data"
 LOG_DIR = DATA_DIR / "request_logs"
 
 store = SessionStore(DATA_DIR / "sessions.json")
+agent_store = AgentBridgeStore(DATA_DIR / "agents.json")
 meter = UsageMeter(DATA_DIR / "usage.json")
 read_cache = ReadCache(DATA_DIR / "read_cache.json")
 terminal_store = TerminalStore(DATA_DIR / "terminal_pending.json")
@@ -219,6 +423,7 @@ async def health(
         "tool_structured": TOOL_STRUCTURED,
         "terminal_tools": sorted(TERMINAL_TOOL_NAMES),
         "terminal_pending": terminal_store.pending_count(DIFY_USER_ID),
+        "agent_bridge": agent_store.stats(),
         "nonstream_flights": (
             nonstream_flights.stats() if nonstream_flights is not None else None
         ),
@@ -311,13 +516,30 @@ async def sessions_new(
     out = store.new_session(
         DIFY_USER_ID, body.cc_session_id, clear_all=bool(body.clear_all)
     )
+
+    def clear_agent_state(parent_sid: str | None = None, *, all_parents: bool = False) -> None:
+        """与主会话解绑同步清理 hook 档案；清理失败不阻断主 API。"""
+        try:
+            if all_parents:
+                agent_store.clear_all()
+            else:
+                agent_store.clear_parent(parent_sid)
+        except Exception as exc:
+            print("[lan] agent state cleanup failed open: {!r}".format(exc))
+
     if body.clear_all:
         terminal_store.clear_all(DIFY_USER_ID)
+        clear_agent_state(all_parents=True)
     elif isinstance(body.cc_session_id, str) and body.cc_session_id.strip():
-        terminal_store.clear_session(DIFY_USER_ID, body.cc_session_id.strip())
+        # 显式解绑只影响这一父 session；不能顺手清掉其它并行 CC 会话的
+        # 子代理报告或身份记录。
+        explicit_sid = body.cc_session_id.strip()
+        terminal_store.clear_session(DIFY_USER_ID, explicit_sid)
+        clear_agent_state(explicit_sid)
     else:
         for sid in out.get("unbound_cc") or []:
             terminal_store.clear_session(DIFY_USER_ID, str(sid))
+            clear_agent_state(str(sid))
     return out
 
 
@@ -343,6 +565,64 @@ async def sessions_switch(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+@app.post("/hooks/subagent-start")
+async def hook_subagent_start(
+    body: dict[str, Any] = Body(...),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> dict[str, Any]:
+    """登记子代理身份，并把可重复验证的 transport marker 注入 child 请求。
+
+    marker 不在这里消费；同一个 child 的后续请求可以继续携带它，直到对应
+    agents.json 记录被清理或容量裁剪后自动失效。
+    """
+    _require_aux_auth(authorization=authorization, x_api_key=x_api_key)
+    if body.get("hook_event_name") != "SubagentStart":
+        raise HTTPException(status_code=400, detail="Expected SubagentStart hook payload")
+    try:
+        transport, marker = agent_store.record_start(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    print(
+        "[lan] hook start parent={} agent={} type={}".format(
+            transport.parent_session_id[:8],
+            transport.agent_id[:16],
+            transport.agent_type or "-",
+        )
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": marker,
+        }
+    }
+
+
+@app.post("/hooks/subagent-stop")
+async def hook_subagent_stop(
+    body: dict[str, Any] = Body(...),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> dict[str, Any]:
+    """保存有界完成报告；不把报告正文通过 hook 反注入 Claude Code。"""
+    _require_aux_auth(authorization=authorization, x_api_key=x_api_key)
+    if body.get("hook_event_name") != "SubagentStop":
+        raise HTTPException(status_code=400, detail="Expected SubagentStop hook payload")
+    try:
+        archived = agent_store.record_stop(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    print(
+        "[lan] hook stop parent={} agent={} tool={} report_chars={}".format(
+            str(archived.get("parent_session_id") or "")[:8],
+            str(archived.get("agent_id") or "")[:16],
+            str(archived.get("tool_use_id") or "-")[:16],
+            archived.get("report_chars") or 0,
+        )
+    )
+    return {"ok": True, **archived}
+
+
 @app.get("/debug/last-request")
 async def debug_last_request(
     authorization: str | None = Header(default=None),
@@ -356,6 +636,14 @@ async def debug_last_request(
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict) and "raw_body" in data:
             data["raw_body"] = {"redacted": True}
+        if isinstance(data, dict):
+            trace_name = (data.get("summary") or {}).get("transport_trace_file")
+            trace_path = (
+                LOG_DIR / str(trace_name)
+                if isinstance(trace_name, str) and trace_name
+                else path.with_suffix(".trace.jsonl")
+            )
+            data["transport_trace"] = read_transport_trace(trace_path)
         return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -384,9 +672,37 @@ async def messages(
     def _req_log(message: str) -> None:
         print("[lan] req={} {}".format(request_id, message))
 
-    accept_sse = "text/event-stream" in (request.headers.get("accept") or "").lower()
-    plan = build_plan(body, accept_sse=accept_sse, tool_structured=TOOL_STRUCTURED)
     request_cc_session_id = extract_cc_session_id(body)
+    # SubagentStart 会把签名身份标记写入子代理请求。解析正文前先验签并剥离，
+    # 防止 transport 身份进入模型上下文；父 session 不符时 fail-closed，绝不串接 CID。
+    transport_extraction = extract_and_strip_transport(body, agent_store)
+    # extract 会原地净化 body；后续判枪、Dify 出站与请求日志都只看剥离后的正文。
+    # marker 的审计信息单列在 log extra，不能把签名 transport 当成提示词再落盘。
+    agent_transport = transport_extraction.transport
+    transport_parent_mismatch = bool(
+        agent_transport
+        and request_cc_session_id
+        and agent_transport.parent_session_id != request_cc_session_id
+    )
+    if transport_parent_mismatch:
+        agent_transport = None
+    if agent_transport:
+        hook_identity_status = "verified"
+    elif transport_parent_mismatch:
+        hook_identity_status = "parent_mismatch"
+    elif transport_extraction.ambiguous:
+        hook_identity_status = "ambiguous"
+    elif transport_extraction.invalid:
+        hook_identity_status = "invalid"
+    else:
+        hook_identity_status = "missing"
+    accept_sse = "text/event-stream" in (request.headers.get("accept") or "").lower()
+    plan = build_plan(
+        body,
+        accept_sse=accept_sse,
+        tool_structured=TOOL_STRUCTURED,
+        agent_id=agent_transport.agent_id if agent_transport else None,
+    )
 
     def _log_request(kind: str, extra: dict[str, Any] | None = None) -> Path | None:
         """请求日志的唯一入口：LOG_REQUESTS 门、fail-open 与 extra 基座各只存在一处。"""
@@ -400,6 +716,15 @@ async def messages(
                 extra={
                     **plan.log_extra(),
                     "request_id": request_id,
+                    "parent_cc_session_id": (
+                        agent_transport.parent_session_id if agent_transport else None
+                    ),
+                    "agent_id": agent_transport.agent_id if agent_transport else None,
+                    "agent_type": agent_transport.agent_type if agent_transport else None,
+                    "transport_markers_removed": transport_extraction.removed,
+                    "transport_ambiguous": transport_extraction.ambiguous,
+                    "transport_parent_mismatch": transport_parent_mismatch,
+                    "hook_identity_status": hook_identity_status,
                     **(extra or {}),
                 },
                 request_id=request_id,
@@ -416,9 +741,13 @@ async def messages(
         input_tokens: int = 1,
         output_tokens: int = 1,
     ):
-        """本地出口的统一交付：按本枪裁定的形态回 SSE / JSON，并记一行完成日志。"""
+        """本地出口的统一响应：按本枪形态构造 SSE / JSON。
+
+        这里的 local_response_ready 只表示代理已经构造好响应；本地短路目前
+        不经过 TracedStreamingResponse，所以它不等于客户端已收到。
+        """
         _req_log(
-            "done http=200 elapsed={:.1f}s local={}".format(
+            "local_response_ready http=200 elapsed={:.1f}s local={}".format(
                 time.monotonic() - request_started, label
             )
         )
@@ -444,7 +773,8 @@ async def messages(
             )
         )
 
-    # 显式 terminal-tool：只消费与本 CC session 精确匹配的 Write/Edit 结果。
+    # 显式 terminal-tool：首枪只登记 after_success；下一枪仅在同一主会话的
+    # Write/Edit tool_result 全部明确成功时本地释放草案，否则消费待决并回到 Dify。
     terminal_resolution = TerminalResolution()
     terminal_resolve_error = ""
     if plan.is_main_window:
@@ -512,6 +842,42 @@ async def messages(
             label="placeholder",
         )
 
+    # 这是 Claude Code 的 UI heartbeat，不是用户任务：本地生成短句即可，
+    # 否则每个子代理会为状态栏额外占用一枪、一个 CID 续写和一份上下文。
+    if plan.is_action_status:
+        status_text = build_action_status(body)
+        _req_log("action status local → {!r} (Dify skipped)".format(status_text))
+        log_path = _log_request(
+            "status_local",
+            {
+                "gun_kind": "status",
+                "skipped_dify": True,
+                "local_status": True,
+                "agent_phase": "status",
+                "cc_session_id": request_cc_session_id,
+            },
+        )
+        patch_request_log(
+            log_path,
+            {
+                "stop_reason": "end_turn",
+                "text_len": len(status_text),
+                "reasoning_len": 0,
+                "tool_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "local_status": True,
+                "skipped_dify": True,
+            },
+            log_dir=LOG_DIR,
+        )
+        return _local_answer(
+            status_text,
+            label="status",
+            input_tokens=0,
+            output_tokens=0,
+        )
+
     client = _client()
     if plan.is_sidecar_summary:
         input_limits = DifyInputLimits({}, "skipped")
@@ -527,6 +893,44 @@ async def messages(
             )
 
     parsed = parse_payload(body)
+    agent_link_count = 0
+    agent_archive_status: dict[str, Any] = {"count": 0, "source": "none"}
+    agent_archive_error = ""
+    try:
+        # 消息链内的任务通知是真源；hook 档案只是有界的 fork/恢复兜底。
+        # 因此查档案前排除链内已有报告，避免同一报告被注入两次。
+        agent_link_count = agent_store.link_notifications(
+            list(parsed.get("agent_notifications") or []),
+            parent_hint=request_cc_session_id,
+        )
+        trusted_tool_ids = {
+            str(item.get("tool_use_id") or "")
+            for item in (parsed.get("agent_notifications") or [])
+            if isinstance(item, dict) and item.get("tool_use_id")
+        }
+        pending_tool_ids = {
+            str(item.get("tool_use_id") or "")
+            for item in (parsed.get("agent_lifecycle", {}).get("pending") or [])
+            if isinstance(item, dict) and item.get("tool_use_id")
+        }
+        all_agent_tool_ids = {
+            str(item.get("tool_use_id") or "")
+            for item in (parsed.get("agent_calls") or [])
+            if isinstance(item, dict) and item.get("tool_use_id")
+        }
+        # false pending 可自动查一次完成档案；已结束的历史委派只有在用户明确索取
+        # 报告时才查。否则每轮都会把旧报告重新灌入当前上下文。
+        eligible_tool_ids = set(pending_tool_ids)
+        if wants_archived_agent_reports(str(parsed.get("current_user") or "")):
+            eligible_tool_ids.update(all_agent_tool_ids)
+        eligible_tool_ids.difference_update(trusted_tool_ids)
+        if plan.is_main_window and eligible_tool_ids:
+            archived = agent_store.find_completed(tool_use_ids=eligible_tool_ids)
+            agent_archive_status = merge_archived_reports(parsed, archived)
+    except Exception as exc:
+        # hook 档案是恢复兜底；任何读写故障都回落到现有消息链。
+        agent_archive_error = "{}: {}".format(type(exc).__name__, exc)
+        _req_log("agent archive failed open: {}".format(agent_archive_error))
     try:
         ob = prepare_text_outbound(
             body=body,
@@ -560,8 +964,8 @@ async def messages(
             },
         )
         message = (
-            "Dify 输入字段 {!r} 为 {} 个字符，超过该应用发布的 max_length={}。"
-            "输入未被裁剪，也未发送至 Dify。"
+            "Dify 逻辑输入字段 {!r} 为 {} 个字符，单字段 max_length={}，"
+            "当前已发布的同名分片也无法完整容纳。输入未被裁剪，也未发送至 Dify。"
         ).format(e.key, e.length, e.limit)
         message += input_shard_capacity_hint(e.key, input_limits.limits)
         return JSONResponse(
@@ -630,30 +1034,88 @@ async def messages(
             "terminal_fallback": terminal_resolution.status == "fallback",
             "terminal_fallback_reason": terminal_resolution.reason,
             "terminal_resolve_error": terminal_resolve_error,
+            "agent_notification_links": agent_link_count,
+            "agent_report_source": agent_archive_status.get("source"),
+            "agent_archive_reports": agent_archive_status.get("count"),
+            "agent_archive_error": agent_archive_error,
         },
     )
     if log_path is not None:
         _req_log("log → {}".format(log_path.name))
+
+    trace_sequence = 0
+
+    def _transport_trace(event: str, **fields: Any) -> None:
+        nonlocal trace_sequence
+        durable = bool(fields.pop("_durable", False))
+        trace_sequence += 1
+        append_transport_trace(
+            log_path,
+            request_id=request_id,
+            sequence=trace_sequence,
+            event=event,
+            elapsed_seconds=time.monotonic() - request_started,
+            fields=fields,
+            durable=durable,
+        )
+
+    _transport_trace(
+        "request_log_created",
+        _durable=True,
+        stream=bool(plan.stream),
+        route=plan.route,
+        gun_kind=plan.kind,
+        attachment_scope=plan.attachment_scope,
+    )
 
     # 当前判枪下到不了：非 placeholder 枪的 route_tag 恒非空，build_dify_query 至少返回它。
     # 留作 fail-safe——判枪或 query 组装哪天产出空串，宁可 400 也不给 Dify 发一个空 query。
     if not (ob.query or "").strip():
         raise HTTPException(status_code=400, detail="Empty query after parsing messages")
 
-    # 会话附着：仅主对话 opus
-    cc_session_id = request_cc_session_id if plan.attach_main else None
+    # 会话附着：主窗口与子代理使用不同命名空间。锁键沿用同一命名空间，使并发
+    # 子代理只串行各自的首次 conversation 创建，不可能竞态附着到父窗口 CID。
+    attachment_scope = plan.attachment_scope
+    cc_session_id = request_cc_session_id if attachment_scope == "main" else None
+    parent_cc_session_id = (
+        agent_transport.parent_session_id
+        if attachment_scope == "subagent" and agent_transport
+        else request_cc_session_id
+        if attachment_scope == "main"
+        else None
+    )
+    agent_id = (
+        agent_transport.agent_id
+        if attachment_scope == "subagent" and agent_transport
+        else None
+    )
     session_bind = "skip"
     conversation_id = None
     binding_epoch: int | None = None
+    scope_epoch: int | None = None
+    reset_epoch: int | None = None
     session_lock = (
-        _session_lock(cc_session_id or "__missing__") if plan.attach_main else None
+        _session_lock(
+            "{}:{}:{}".format(
+                attachment_scope,
+                parent_cc_session_id or "__missing__",
+                agent_id or "-",
+            )
+        )
+        if attachment_scope != "none"
+        else None
     )
 
     async def prepare_session_attachment() -> None:
-        nonlocal conversation_id, session_bind, binding_epoch
-        if not plan.attach_main:
+        nonlocal conversation_id, session_bind, binding_epoch, scope_epoch, reset_epoch
+        if attachment_scope == "none":
             return
-        resolved = store.resolve_conversation(DIFY_USER_ID, cc_session_id)
+        if attachment_scope == "subagent":
+            resolved = store.resolve_agent_conversation(
+                DIFY_USER_ID, parent_cc_session_id, agent_id
+            )
+        else:
+            resolved = store.resolve_conversation(DIFY_USER_ID, cc_session_id)
         cid = resolved.get("conversation_id")
         conversation_id = cid.strip() if isinstance(cid, str) and cid.strip() else None
         session_bind = str(resolved.get("session_bind") or "unknown")
@@ -661,20 +1123,50 @@ async def messages(
             binding_epoch = int(resolved.get("binding_epoch"))
         except (TypeError, ValueError):
             binding_epoch = None
+        try:
+            scope_epoch = int(resolved.get("scope_epoch"))
+        except (TypeError, ValueError):
+            scope_epoch = None
+        try:
+            reset_epoch = int(resolved.get("reset_epoch"))
+        except (TypeError, ValueError):
+            reset_epoch = None
 
     def remember(cid: str) -> None:
-        if plan.attach_main:
+        nonlocal conversation_id
+        # Dify 只在成功收尾后才给出可用 CID；先更新本枪日志状态，再按 scope
+        # 写入对应 namespace，避免失败枪污染主/子会话绑定。
+        conversation_id = cid
+        if attachment_scope == "main":
             try:
                 ok = store.remember(
                     DIFY_USER_ID,
                     cid,
                     cc_session_id=cc_session_id,
                     expected_epoch=binding_epoch,
+                    expected_scope_epoch=scope_epoch,
+                    expected_reset_epoch=reset_epoch,
                 )
                 if ok is False:
-                    _req_log("conversation remember skipped: binding epoch changed")
+                    _req_log("conversation remember skipped: binding scope changed")
             except Exception as exc:
                 _req_log("conversation remember failed open: {!r}".format(exc))
+        elif attachment_scope == "subagent":
+            try:
+                ok = store.remember_agent(
+                    DIFY_USER_ID,
+                    cid,
+                    parent_cc_session_id=parent_cc_session_id,
+                    agent_id=agent_id,
+                    expected_epoch=None,
+                    expected_scope_epoch=scope_epoch,
+                    expected_reset_epoch=reset_epoch,
+                )
+                if ok is False:
+                    _req_log("agent conversation remember skipped: binding scope changed")
+            except Exception as exc:
+                _req_log("agent conversation remember failed open: {!r}".format(exc))
+        _patch_session_state()
 
     ob = await attach_images_to_outbound(
         ob,
@@ -687,6 +1179,20 @@ async def messages(
     )
     metrics_line = outbound_metrics_line(ob)
     _req_log(metrics_line)
+
+    def _log_session_attachment() -> None:
+        _req_log(
+            "dify chat scope={} cid={} bind={} parent_sid={} agent={} "
+            "files×{} query_chars={}".format(
+                attachment_scope,
+                (conversation_id or "")[:12] or "-",
+                session_bind,
+                (parent_cc_session_id or "")[:8] or "-",
+                (agent_id or "")[:12] or "-",
+                len(ob.dify_files),
+                len(ob.query or ""),
+            )
+        )
 
     input_tokens_hint = estimate_input_tokens_from_request(
         query=ob.query,
@@ -716,23 +1222,16 @@ async def messages(
             )
         )
 
-    _req_log(
-        "dify chat attach_main={} cid={} bind={} cc_sid={} files×{} query_chars={}".format(
-            "yes" if plan.attach_main else "no",
-            (conversation_id or "")[:12] or "-",
-            session_bind,
-            (cc_session_id or "")[:8] or "-",
-            len(ob.dify_files),
-            len(ob.query or ""),
-        )
-    )
     if LOG_REQUESTS and log_path is not None:
         patch_request_log(
             log_path,
             {
                 "attach_main": plan.attach_main,
+                "attachment_scope": attachment_scope,
                 "conversation_id_out": conversation_id,
                 "cc_session_id": cc_session_id,
+                "parent_cc_session_id": parent_cc_session_id,
+                "agent_id": agent_id,
                 "session_bind": session_bind,
                 "dify_files": len(ob.dify_files),
                 "image_failed": ob.image_failed,
@@ -759,6 +1258,8 @@ async def messages(
                     log_dir=LOG_DIR,
                 )
             except Exception as e:
+                # response_log_patch 还会读取工具摘要的外部形状；即使上游产出
+                # 畸形 parts，日志旁路也不能反向打断已经得到的答复。
                 print("[lan] response log patch failed: {}".format(e))
 
     def _patch_summary(values: dict[str, Any]) -> None:
@@ -772,10 +1273,21 @@ async def messages(
             )
 
     def _patch_session_state() -> None:
+        agent_phase = (
+            "initial"
+            if attachment_scope == "subagent" and session_bind == "miss"
+            else "continuation"
+            if attachment_scope == "subagent" and session_bind == "hit"
+            else "none"
+        )
         _patch_summary(
             {
                 "conversation_id_out": conversation_id,
                 "cc_session_id": cc_session_id,
+                "parent_cc_session_id": parent_cc_session_id,
+                "agent_id": agent_id,
+                "attachment_scope": attachment_scope,
+                "agent_phase": agent_phase,
                 "session_bind": session_bind,
             }
         )
@@ -815,6 +1327,22 @@ async def messages(
                 )
             )
 
+    def _on_dify_transport(event: str, fields: dict[str, Any]) -> None:
+        # Dify 回调字段只包含事件计数/类型与异常摘要，不含 data 正文。
+        _transport_trace(
+            event,
+            _durable=event
+            in {
+                "dify_response_headers",
+                "dify_first_event",
+                "dify_terminal_event",
+                "dify_stream_cancelled",
+                "dify_stream_error",
+                "dify_stream_closed",
+            },
+            **fields,
+        )
+
     def _new_event_iter():
         return stream_chat_messages(
             base_url=DIFY_BASE_URL,
@@ -826,6 +1354,7 @@ async def messages(
             inputs=ob.dify_inputs,
             files=ob.dify_files or None,
             on_accepted=_bill_on_accepted,
+            on_transport_event=_on_dify_transport,
         )
 
     flight_state = "direct"
@@ -833,8 +1362,13 @@ async def messages(
     try:
         if plan.stream:
             result_out: dict[str, Any] = {}
+            stream_completed = False
+            stream_exception: BaseException | None = None
+            stream_error_event = False
+            message_stop_generated = False
 
             async def gen_and_patch():
+                nonlocal stream_completed, stream_exception, stream_error_event, message_stop_generated
                 lock_acquired = False
                 if session_lock is not None:
                     await session_lock.acquire()
@@ -842,12 +1376,7 @@ async def messages(
                 try:
                     await prepare_session_attachment()
                     _patch_session_state()
-                    _req_log(
-                        "session attach cid={} bind={}".format(
-                            (conversation_id or "")[:12] or "-",
-                            session_bind,
-                        )
-                    )
+                    _log_session_attachment()
                     event_iter = _new_event_iter()
                     async for line in dify_events_to_anthropic_sse(
                         event_iter,
@@ -859,17 +1388,102 @@ async def messages(
                         on_final_parts=_register_terminal,
                         decode_unicode_wire=ob.unicode_wire_active,
                     ):
+                        event_types = _sse_event_types(line)
+                        generated_index = int(result_out.get("_trace_generated_chunks") or 0) + 1
+                        result_out["_trace_generated_chunks"] = generated_index
+                        if _trace_chunk(generated_index, event_types):
+                            _transport_trace(
+                                "downstream_chunk_generated",
+                                body_chunk_index=generated_index,
+                                body_bytes=len(line.encode("utf-8")),
+                                event_types=event_types,
+                            )
+                        if "error" in event_types:
+                            stream_error_event = True
+                        if "message_stop" in event_types:
+                            message_stop_generated = True
                         yield line
-                except Exception as e:
-                    result_out.setdefault("error", str(e))
-                    _req_log("stream error: {}".format(e))
+                    stream_completed = True
+                    _transport_trace(
+                        "downstream_stream_generated_complete",
+                        _durable=True,
+                        message_stop_generated=message_stop_generated,
+                        error_event_generated=stream_error_event,
+                    )
+                except asyncio.CancelledError as exc:
+                    stream_exception = exc
+                    result_out.setdefault("error", "CancelledError")
+                    _transport_trace(
+                        "downstream_generator_cancelled",
+                        _durable=True,
+                        exception_type=type(exc).__name__,
+                        message_stop_generated=message_stop_generated,
+                        error_event_generated=stream_error_event,
+                    )
+                    raise
+                except BaseException as exc:
+                    stream_exception = exc
+                    result_out.setdefault(
+                        "error",
+                        "{}: {}".format(type(exc).__name__, str(exc)).strip(),
+                    )
+                    _req_log(
+                        "stream error: {}: {}".format(type(exc).__name__, str(exc))
+                    )
+                    _transport_trace(
+                        "downstream_generator_error",
+                        _durable=True,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc).strip()[:400],
+                        message_stop_generated=message_stop_generated,
+                        error_event_generated=stream_error_event,
+                    )
                     raise
                 finally:
+                    client_disconnected: bool | None
+                    try:
+                        client_disconnected = await request.is_disconnected()
+                    except Exception as exc:
+                        client_disconnected = None
+                        _transport_trace(
+                            "downstream_disconnect_probe_error",
+                            exception_type=type(exc).__name__,
+                            exception_message=str(exc).strip()[:400],
+                        )
+                    delivery_status = (
+                        "stream_error_delivered"
+                        if stream_completed and stream_error_event
+                        else "stream_complete"
+                        if stream_completed and message_stop_generated
+                        else "stream_complete_without_message_stop"
+                        if stream_completed
+                        else "client_disconnected"
+                        if client_disconnected is True
+                        else "stream_incomplete"
+                    )
+                    _transport_trace(
+                        "downstream_stream_finally",
+                        _durable=True,
+                        stream_completed=stream_completed,
+                        client_disconnected=client_disconnected,
+                        delivery_status=delivery_status,
+                        exception_type=(
+                            type(stream_exception).__name__
+                            if stream_exception is not None
+                            else ""
+                        ),
+                        message_stop_generated=message_stop_generated,
+                        error_event_generated=stream_error_event,
+                    )
                     _patch_response(result_out)
                     elapsed = time.monotonic() - request_started
                     _patch_summary(
                         {
-                            "delivery_status": "stream_closed",
+                            "delivery_status": delivery_status,
+                            "stream_completed": stream_completed,
+                            "message_stop_generated": message_stop_generated,
+                            "error_event_generated": stream_error_event,
+                            "client_disconnected": client_disconnected,
                             "elapsed_seconds": round(elapsed, 3),
                         }
                     )
@@ -877,13 +1491,21 @@ async def messages(
                     if lock_acquired:
                         session_lock.release()
 
-            return StreamingResponse(
+            return TracedStreamingResponse(
                 gen_and_patch(),
+                trace=_transport_trace,
                 media_type="text/event-stream",
                 headers=_SSE_HEADERS,
             )
 
-        namespace = "{}\0{}\0{}".format(DIFY_BASE_URL, DIFY_USER_ID, api_key)
+        namespace = "{}\0{}\0{}\0{}\0{}\0{}".format(
+            DIFY_BASE_URL,
+            DIFY_USER_ID,
+            api_key,
+            attachment_scope,
+            parent_cc_session_id or "",
+            agent_id or "",
+        )
         flight_key = request_fingerprint(body, namespace=namespace)
         upstream_started = time.monotonic()
 
@@ -935,12 +1557,7 @@ async def messages(
             try:
                 await prepare_session_attachment()
                 _patch_session_state()
-                _req_log(
-                    "session attach cid={} bind={}".format(
-                        (conversation_id or "")[:12] or "-",
-                        session_bind,
-                    )
-                )
+                _log_session_attachment()
                 return await _run_collect_once()
             finally:
                 if lock_acquired:

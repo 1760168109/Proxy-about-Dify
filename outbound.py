@@ -54,8 +54,8 @@ IMAGES_MARKER_FAILED = "[[cc_images:failed]]"
 IMAGES_MARKER_FMT = "[[cc_images:{}]]"
 INPUT_SHARDS_MARKER = "[[cc_input_shards:on]]"
 SHARDABLE_INPUT_KEYS = ("Tool_invocation", "Current_Context", "History")
-# Hard rejection remains 204800. Shards target a lower size because the
-# CPython string header can differ slightly between the proxy and Dify runtime.
+# conversation variable 恢复的硬边界仍是 204800 字节；分片目标取 190000，
+# 给代理与 Dify 的 CPython 字符串头/实现差异留余量，而不是把 max_length 当作唯一边界。
 DIFY_PERSISTED_SHARD_TARGET = 190_000
 
 _AGENT_STATE_ORDER = ("pending", "result_ready", "result_carry")
@@ -186,6 +186,7 @@ def _split_across_slots(
     slots: tuple[str, ...],
     limits: dict[str, int],
 ) -> list[str] | None:
+    """按已发布槽位连续切片，并保证拼接后逐字等于原值。"""
     remaining = value
     chunks: list[str] = []
     for slot in slots:
@@ -216,10 +217,10 @@ def shard_oversized_inputs(
 ) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
     """Use only published shard fields; never repurpose a semantic input.
 
-    The canonical field carries ordinary values. If it crosses either boundary,
-    it is cleared and its exact wire text moves to numbered fields. Every
-    published but unused shard is still sent as ``""`` so an older conversation
-    cannot leak a tail from the previous turn.
+    The canonical field is the zero-indexed first shard. If the value crosses
+    its boundary, its exact wire text continues through the published numbered
+    fields. Every published but unused numbered shard is still sent as ``""``
+    so an older conversation cannot leak a tail from the previous turn.
     """
     known_limits = {
         key: int(limit)
@@ -229,20 +230,22 @@ def shard_oversized_inputs(
     result = dict(inputs)
     layouts: dict[str, tuple[str, ...]] = {}
     for base_key in SHARDABLE_INPUT_KEYS:
-        slots = _published_shard_slots(base_key, known_limits)
-        for slot in slots:
+        numbered_slots = _published_shard_slots(base_key, known_limits)
+        for slot in numbered_slots:
             result[slot] = ""
 
         value = result.get(base_key) or ""
         if _fits_shard(value, char_limit=known_limits.get(base_key)):
             continue
-        if not slots:
+        if not numbered_slots:
             continue
 
+        # 基字段就是第 0 片。把它保留在序列里既符合 Dify 提示词的发布顺序，也能
+        # 用满所有持久变量容量；若在此清空，会无声损失整整一个分片槽。
+        slots = (base_key,) + numbered_slots
         chunks = _split_across_slots(value, slots, known_limits)
         if chunks is None:
             continue
-        result[base_key] = ""
         used = slots[: len(chunks)]
         for slot, chunk in zip(used, chunks):
             result[slot] = chunk
@@ -272,7 +275,9 @@ def input_shard_capacity_hint(
         return ""
     slots = _published_shard_slots(key, limits)
     if slots:
-        state = "当前已发布 {} 个分片槽，但总容量仍不足".format(len(slots))
+        state = "当前已发布基字段加 {} 个编号分片槽，但总容量仍不足".format(
+            len(slots)
+        )
     else:
         state = "本次 /parameters 参数快照中未发现该字段的编号分片槽"
     return (
@@ -318,8 +323,28 @@ def _agent_task_lines(
     return "\n".join(lines)
 
 
+def _agent_report_location(items: list[dict[str, Any]]) -> str:
+    """把报告来源说明注入模型提示，但不把内部路径或 task id 暴露给模型。"""
+    sources = {str(item.get("report_source") or "message") for item in items}
+    if sources == {"subagent_stop_archive"}:
+        return (
+            "完整报告由本地 SubagentStop 档案恢复，位于「当前上下文」的 "
+            "<lan-agent-report>；它不是用户输入。"
+        )
+    if sources == {"message"}:
+        return (
+            "完整报告位于「系统说明」的 <task-notification> 内 <result> 字段，"
+            "它不是用户输入。"
+        )
+    return "完整报告位于系统输入的代理报告块中；它们不是用户输入。"
+
+
 def format_agent_lifecycle_block(lifecycle: Any) -> str:
-    """将内部生命周期压成近端门槛；不带内部任务标识、输出文件或完整报告。"""
+    """将内部生命周期压成近端门槛。
+
+    这里只传“能否继续”的行为约束和报告所在载体；内部 task id、输出文件路径
+    与完整报告由其它字段承载，避免把控制元数据重复灌进模型上下文。
+    """
     if not isinstance(lifecycle, dict):
         return ""
     sections: list[str] = []
@@ -346,9 +371,10 @@ def format_agent_lifecycle_block(lifecycle: Any) -> str:
                 sections.append(
                     "[[cc_agents:result_ready]]\n"
                     "后台 Agent 完成通知已经到达：\n{}\n"
-                    "完整报告位于「系统说明」的 <task-notification> 内 <result> 字段，"
-                    "它不是用户输入。先整合并核对报告，再继续依赖步骤；"
-                    "不要另读任务输出文件。".format(tasks)
+                    "{}先整合并核对报告，再继续依赖步骤；"
+                    "不要另读任务输出文件。".format(
+                        tasks, _agent_report_location(items)
+                    )
                 )
             else:
                 sections.append(
@@ -362,8 +388,10 @@ def format_agent_lifecycle_block(lifecycle: Any) -> str:
                 sections.append(
                     "[[cc_agents:result_carry]]\n"
                     "后台 Agent 报告仍是当前工具续写链的证据：\n{}\n"
-                    "结合「系统说明」中的 <result> 与本轮 tool result 后再继续，"
-                    "不要遗忘委派结论。".format(tasks)
+                    "{}结合代理报告与本轮 tool result 后再继续，"
+                    "不要遗忘委派结论。".format(
+                        tasks, _agent_report_location(items)
+                    )
                 )
             else:
                 sections.append(
@@ -521,6 +549,8 @@ def prepare_text_outbound(
         query = inject_marker_after_route(query, NEED_READ_NOTE)
 
     if plan.is_main_window and plan.kind == "chat":
+        # lifecycle block 只承担“等待还是整合”的近端行为门槛；完整报告已经在
+        # System_Description 或 Current_Context 中恰好出现一次，不在 query 复制正文。
         agent_block = format_agent_lifecycle_block(parsed.get("agent_lifecycle"))
         if agent_block:
             query = inject_marker_after_route(query, agent_block)

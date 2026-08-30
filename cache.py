@@ -96,7 +96,7 @@ def _is_context_placeholder(text: str | None) -> bool:
 
 
 class ReadCache:
-    """JSON 落盘：{ users: { user_id: { norm_path: {path, content, chars, updated_at} } } }"""
+    """JSON 落盘：{ users: { user_id: { norm_path: {path, content, updated_at} } } }"""
 
     def __init__(
         self,
@@ -144,7 +144,6 @@ class ReadCache:
         bucket[key] = {
             "path": path,
             "content": text,
-            "chars": len(text),
             "updated_at": time.time(),
         }
         if len(bucket) > self.max_entries_per_user:

@@ -6,7 +6,7 @@ import json
 import uuid
 from pathlib import Path
 
-from sessions import MAX_BY_CC, SessionStore, extract_cc_session_id
+from sessions import MAX_BY_CC, MAX_SCOPE_EPOCHS, SessionStore, extract_cc_session_id
 
 S1 = "11111111-1111-1111-1111-111111111111"
 S2 = "22222222-2222-2222-2222-222222222222"
@@ -80,6 +80,14 @@ def test_missing_ghost_current_dropped(tmp_path: Path):
     assert r["session_bind"] == "missing" and r["conversation_id"] is None
 
 
+def test_missing_current_only_sticky_is_allowed_when_by_cc_is_empty(tmp_path: Path):
+    store = _store(tmp_path)
+    store.remember("u1", "cid-current-only")
+    r = store.resolve_conversation("u1", None)
+    assert r["session_bind"] == "missing"
+    assert r["conversation_id"] == "cid-current-only"
+
+
 def test_new_session_variants(tmp_path: Path):
     store = _store(tmp_path)
     store.remember("u1", "cid1", cc_session_id=S1)
@@ -136,6 +144,217 @@ def test_binding_epoch_rejects_stale_inflight_remember(tmp_path: Path):
         is False
     )
     assert store.resolve_conversation("u1", S1)["session_bind"] == "miss"
+
+
+def test_unbinding_one_session_does_not_drop_parallel_other_session_result(tmp_path: Path):
+    store = _store(tmp_path)
+    resolved_s1 = store.resolve_conversation("u1", S1)
+    resolved_s2 = store.resolve_conversation("u1", S2)
+
+    store.new_session("u1", S1)
+
+    assert store.remember(
+        "u1",
+        "cid-s2",
+        cc_session_id=S2,
+        expected_epoch=resolved_s2["binding_epoch"],
+        expected_scope_epoch=resolved_s2["scope_epoch"],
+        expected_reset_epoch=resolved_s2["reset_epoch"],
+    )
+    assert not store.remember(
+        "u1",
+        "cid-stale-s1",
+        cc_session_id=S1,
+        expected_epoch=resolved_s1["binding_epoch"],
+        expected_scope_epoch=resolved_s1["scope_epoch"],
+        expected_reset_epoch=resolved_s1["reset_epoch"],
+    )
+    assert store.resolve_conversation("u1", S2)["conversation_id"] == "cid-s2"
+
+
+def test_switch_keeps_new_selection_when_parallel_other_session_finishes(tmp_path: Path):
+    store = _store(tmp_path)
+    store.remember("u1", "cid-s1-old", cc_session_id=S1)
+    resolved_s2 = store.resolve_conversation("u1", S2)
+
+    store.switch("u1", "cid-s1-selected", cc_session_id=S1)
+
+    assert store.remember(
+        "u1",
+        "cid-s2-late",
+        cc_session_id=S2,
+        expected_epoch=resolved_s2["binding_epoch"],
+        expected_scope_epoch=resolved_s2["scope_epoch"],
+        expected_reset_epoch=resolved_s2["reset_epoch"],
+    )
+    state = store.get_state("u1")
+    assert state["current"] == "cid-s1-selected"
+    assert state["cc_session_id"] == S1
+    assert state["by_cc"][S2]["dify_cid"] == "cid-s2-late"
+
+
+def test_switch_rejects_stale_write_for_same_session(tmp_path: Path):
+    store = _store(tmp_path)
+    resolved_s1 = store.resolve_conversation("u1", S1)
+    store.switch("u1", "cid-s1-selected", cc_session_id=S1)
+
+    assert not store.remember(
+        "u1",
+        "cid-s1-stale",
+        cc_session_id=S1,
+        expected_epoch=resolved_s1["binding_epoch"],
+        expected_scope_epoch=resolved_s1["scope_epoch"],
+        expected_reset_epoch=resolved_s1["reset_epoch"],
+    )
+    state = store.get_state("u1")
+    assert state["current"] == "cid-s1-selected"
+    assert state["by_cc"][S1]["dify_cid"] == "cid-s1-selected"
+
+
+def test_late_other_session_does_not_evict_selected_current_mapping(tmp_path: Path):
+    store = SessionStore(tmp_path / "sessions.json", max_by_cc=1)
+    resolved_s2 = store.resolve_conversation("u1", S2)
+    store.switch("u1", "cid-s1-selected", cc_session_id=S1)
+
+    assert store.remember(
+        "u1",
+        "cid-s2-late",
+        cc_session_id=S2,
+        expected_epoch=resolved_s2["binding_epoch"],
+        expected_scope_epoch=resolved_s2["scope_epoch"],
+        expected_reset_epoch=resolved_s2["reset_epoch"],
+    )
+    state = store.get_state("u1")
+    assert state["current"] == "cid-s1-selected"
+    assert list(state["by_cc"]) == [S1]
+
+
+def test_clear_all_rejects_unmapped_inflight_session(tmp_path: Path):
+    store = _store(tmp_path)
+    resolved_s2 = store.resolve_conversation("u1", S2)
+    store.new_session("u1", clear_all=True)
+
+    assert not store.remember(
+        "u1",
+        "cid-after-clear-all",
+        cc_session_id=S2,
+        expected_epoch=resolved_s2["binding_epoch"],
+        expected_scope_epoch=resolved_s2["scope_epoch"],
+        expected_reset_epoch=resolved_s2["reset_epoch"],
+    )
+
+
+def test_scope_fence_requires_both_scope_and_reset_tokens(tmp_path: Path):
+    store = _store(tmp_path)
+    resolved = store.resolve_conversation("u1", S1)
+    assert not store.remember(
+        "u1",
+        "cid-half-token",
+        cc_session_id=S1,
+        expected_scope_epoch=resolved["scope_epoch"],
+    )
+
+
+def test_scope_tombstone_capacity_crosses_reset_fence_instead_of_unsafe_eviction(
+    tmp_path: Path,
+):
+    store = _store(tmp_path)
+    in_flight = store.resolve_conversation("u1", S1)
+    current_only = store.resolve_conversation("u1", None)
+    for index in range(MAX_SCOPE_EPOCHS + 1):
+        store.new_session("u1", "scope-{:04d}".format(index))
+
+    assert not store.remember(
+        "u1",
+        "cid-stale-after-scope-reset",
+        cc_session_id=S1,
+        expected_epoch=in_flight["binding_epoch"],
+        expected_scope_epoch=in_flight["scope_epoch"],
+        expected_reset_epoch=in_flight["reset_epoch"],
+    )
+    assert not store.remember(
+        "u1",
+        "cid-current-stale-after-scope-reset",
+        expected_epoch=current_only["binding_epoch"],
+        expected_scope_epoch=current_only["scope_epoch"],
+        expected_reset_epoch=current_only["reset_epoch"],
+    )
+
+
+def test_unbinding_one_parent_only_invalidates_its_agent_writes(tmp_path: Path):
+    store = _store(tmp_path)
+    first = store.resolve_agent_conversation("u1", S1, "agent-one")
+    second = store.resolve_agent_conversation("u1", S2, "agent-two")
+
+    store.new_session("u1", S1)
+
+    assert not store.remember_agent(
+        "u1",
+        "cid-agent-one-stale",
+        parent_cc_session_id=S1,
+        agent_id="agent-one",
+        expected_scope_epoch=first["scope_epoch"],
+        expected_reset_epoch=first["reset_epoch"],
+    )
+    assert store.remember_agent(
+        "u1",
+        "cid-agent-two",
+        parent_cc_session_id=S2,
+        agent_id="agent-two",
+        expected_scope_epoch=second["scope_epoch"],
+        expected_reset_epoch=second["reset_epoch"],
+    )
+
+
+def test_agent_conversations_are_isolated_from_main_and_each_other(tmp_path: Path):
+    store = _store(tmp_path)
+    store.remember("u1", "cid-main", cc_session_id=S1)
+
+    first = store.resolve_agent_conversation("u1", S1, "agent-one")
+    second = store.resolve_agent_conversation("u1", S1, "agent-two")
+    assert first["session_bind"] == second["session_bind"] == "miss"
+
+    assert store.remember_agent(
+        "u1",
+        "cid-agent-one",
+        parent_cc_session_id=S1,
+        agent_id="agent-one",
+        expected_epoch=first["binding_epoch"],
+    )
+    assert store.remember_agent(
+        "u1",
+        "cid-agent-two",
+        parent_cc_session_id=S1,
+        agent_id="agent-two",
+        expected_epoch=second["binding_epoch"],
+    )
+
+    assert store.resolve_conversation("u1", S1)["conversation_id"] == "cid-main"
+    assert (
+        store.resolve_agent_conversation("u1", S1, "agent-one")["conversation_id"]
+        == "cid-agent-one"
+    )
+    assert (
+        store.resolve_agent_conversation("u1", S1, "agent-two")["conversation_id"]
+        == "cid-agent-two"
+    )
+    assert store.get_current("u1") == "cid-main"
+
+
+def test_unbinding_parent_session_also_clears_its_agent_conversations(tmp_path: Path):
+    store = _store(tmp_path)
+    store.remember("u1", "cid-main", cc_session_id=S1)
+    store.remember_agent(
+        "u1", "cid-agent", parent_cc_session_id=S1, agent_id="agent-one"
+    )
+    store.remember_agent(
+        "u1", "cid-other-agent", parent_cc_session_id=S2, agent_id="agent-two"
+    )
+
+    store.new_session("u1", S1)
+
+    assert store.resolve_agent_conversation("u1", S1, "agent-one")["session_bind"] == "miss"
+    assert store.resolve_agent_conversation("u1", S2, "agent-two")["session_bind"] == "hit"
 
 
 def test_lru_drops_oldest(tmp_path: Path):

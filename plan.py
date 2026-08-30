@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """判枪：一次扫 body，定出本枪的全部策略。
 
-route（haiku/opus/local）· kind（chat/title/recap/compact/placeholder）·
-tools · 续主会话 · inputs 物化档 · 结构化出口 · 出站流式形态。
+route（haiku/opus/local）· kind（chat/status/title/recap/compact/placeholder）·
+tools · attachment scope · inputs 物化档 · 结构化出口 · 出站流式形态。
 
-优先级：占位模板 → 旁路（title/recap/compact）→ 子代理 → testandlife → model 名 → 默认 opus。
+优先级：占位模板 → 子代理动作状态 → 旁路（title/recap/compact）→ 子代理 →
+testandlife → model 名 → 默认 opus。
 
 模型档（route）与枪型（kind）是两件事：compact 走 opus 换压缩质量，但 inputs 物化档、
 query 载体与「不续主会话指针」仍由枪型决定，不得改由模型档推导。
@@ -17,10 +18,12 @@ from typing import Any, Literal
 
 from parse import strip_reminders, system_to_text, text_from_content
 from protocol import DEFAULT_MODEL, MODEL_ALIASES
+from status import is_action_status_request
 
 Route = Literal["haiku", "opus", "local"]
-GunKind = Literal["placeholder", "title", "recap", "compact", "chat"]
+GunKind = Literal["placeholder", "status", "title", "recap", "compact", "chat"]
 QueryMode = Literal["title_fold", "history_current", "opus_continue"]
+AttachmentScope = Literal["main", "subagent", "none"]
 
 # query 首行标记，供岚 if-else「包含」匹配；改动须同步岚工作流
 ROUTE_TAG_HAIKU = "[[cc_route:haiku]]"
@@ -115,7 +118,9 @@ class Plan:
     kind: GunKind = "chat"
     trim_mode: str | None = None
     enable_tools: bool = False
-    attach_main: bool = False
+    # ``main`` 续主 CID，``subagent`` 续按身份隔离的 CID，``none`` 不写会话；
+    # 用显式三态代替一个容易被旁路/子代理误用的 attach_main 布尔值。
+    attachment_scope: AttachmentScope = "none"
     tool_structured: bool = False
     query_mode: QueryMode = "opus_continue"
     is_main_window: bool = True
@@ -125,12 +130,22 @@ class Plan:
         return self.kind == "placeholder"
 
     @property
+    def is_action_status(self) -> bool:
+        """是否为 CC 的 UI 状态心跳；该枪必须走本地短路。"""
+        return self.kind == "status"
+
+    @property
+    def attach_main(self) -> bool:
+        """兼容旧日志/调用方；新逻辑以 attachment_scope 为真源。"""
+        return self.attachment_scope == "main"
+
+    @property
     def is_sidecar_summary(self) -> bool:
         return self.kind in SIDECAR_KINDS
 
     @property
     def bill(self) -> bool:
-        return self.kind != "placeholder"
+        return self.route != "local"
 
     def log_extra(self) -> dict[str, Any]:
         return {
@@ -144,6 +159,7 @@ class Plan:
             "trim_mode": self.trim_mode,
             "enable_tools": self.enable_tools,
             "attach_main": self.attach_main,
+            "attachment_scope": self.attachment_scope,
             "tool_structured": self.tool_structured,
             "query_mode": self.query_mode,
             "is_main_window": self.is_main_window,
@@ -153,10 +169,25 @@ class Plan:
 # ── 检测器 ───────────────────────────────────────────────────────────
 
 
-def _last_user_text(body: dict[str, Any]) -> str:
+def _last_user_control_text(body: dict[str, Any]) -> str:
+    """末条 user 的控制文案；工具结果正文不参与判枪指纹。
+
+    ``tool_result`` 是任务证据，不是 Claude Code 的旁路控制信号。真实联调曾因
+    工具正文恰含 ``title`` / ``compact`` 字样，把普通子代理续写误判为
+    title/haiku；因此这里刻意只读取 string 或 text block，不能改回整条摊平。
+    """
     for m in reversed(body.get("messages") or []):
         if isinstance(m, dict) and m.get("role") == "user":
-            return text_from_content(m.get("content"))
+            content = m.get("content")
+            if isinstance(content, str):
+                return content
+            if not isinstance(content, list):
+                return ""
+            return "\n".join(
+                str(block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
     return ""
 
 
@@ -271,6 +302,7 @@ def build_plan(
     *,
     accept_sse: bool = False,
     tool_structured: bool = False,
+    agent_id: str | None = None,
 ) -> Plan:
     """一次扫 body 组装策略；main 不得再重扫旁路指纹。
 
@@ -282,12 +314,10 @@ def build_plan(
         model = DEFAULT_MODEL
     stream = bool(body.get("stream")) if "stream" in body else bool(accept_sse)
 
-    # 一次扫 body：system 与末条 user 各摊平一次，供下面全部检测器复用。
-    # text_from_content 对含完整文件正文的 tool_result 会构造整份字符串副本，
-    # 原先五个检测器各自摊平一遍，与本模块「一次扫 body」的声明相违。
-    # 控制信号只取当前请求壳与末条 user，不追溯历史正文。
+    # system 保留旁路任务指纹；user 只取控制文本。不要用 text_from_content
+    # 摊平 user content：那既会复制完整 tool_result，也会把任务证据误当控制信号。
     system_text = system_to_text(body.get("system"))
-    last_user = _last_user_text(body)
+    last_user = _last_user_control_text(body)
     blob_low = (system_text + "\n" + last_user).lower()
 
     is_title = is_title_generation(system_text, last_user)
@@ -305,9 +335,23 @@ def build_plan(
             is_main_window=False,
         )
 
+    subagent = is_subagent_session(body, system_text)
+    # 状态请求发生在子代理内部，且固定要求“不调用工具”；先于普通 route
+    # 判定短路，避免它消耗子代理 CID 锁和 Dify 额度。
+    if subagent and is_action_status_request(last_user):
+        return Plan(
+            model=model,
+            stream=stream,
+            route="local",
+            route_tag="",
+            route_reasons=["action_status_prompt_v1"],
+            is_subagent=subagent,
+            kind="status",
+            is_main_window=False,
+        )
+
     mlow = model.strip().lower()
     reasons: list[str] = []
-    subagent = is_subagent_session(body, system_text)
 
     # 指纹漏判的兜底与真 compact 同档：兜底若只改 route 会产出策略不自洽的第四类枪。
     is_compact_like = is_compact or any(
@@ -391,8 +435,14 @@ def build_plan(
         kind=kind,
         trim_mode=trim_mode,
         enable_tools=enable_tools,
-        # 守则 4：旁路摘要即使走 opus 也不得续主会话指针。
-        attach_main=(route == "opus" and not subagent and not is_sidecar),
+        # 主/子身份已由上游 hook 决定；旁路摘要即使走 opus 也不得续主会话指针。
+        attachment_scope=(
+            "subagent"
+            if subagent and agent_id
+            else "main"
+            if route == "opus" and not subagent and not is_sidecar
+            else "none"
+        ),
         tool_structured=bool(tool_structured and enable_tools and route == "opus"),
         query_mode=query_mode,
         is_main_window=(not subagent) and (not is_sidecar),
