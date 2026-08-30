@@ -1,43 +1,82 @@
 # lan · 本地代理（Claude Code ↔ Dify「岚」）
 
-把 Dify 上的「岚」接进 Claude Code：代理在本机监听，把 Anthropic Messages 请求翻译成
-Dify chat-messages，再把岚的回答（含思考与工具调用）翻译回去。
+lan 在本机监听 Anthropic Messages 请求，将其转换为 Dify `chat-messages`，再把岚的回答、思考与工具调用转换回 Claude Code。工具执行、权限与文件读写仍由 Claude Code 负责。
 
 ```powershell
-lan        # 启动 → http://127.0.0.1:7272；改 .py 后须重启
+lan        # 启动 → http://127.0.0.1:7272；运行窗口须保持开启
 ```
 
-机制说明见 **[架构.md](./架构.md)**；教训与守则见 **[经验.md](./经验.md)**。
+系统机制与当前契约见 **[架构.md](./架构.md)**；故障教训、保护门与待办见 **[经验.md](./经验.md)**。
 
----
+## 第一次安装
 
-## 安装（一次）
+### 准备与取得文件
 
-需要：Windows · PowerShell 7 · Python 3（勾选 Add to PATH）· Claude Code。
+需要 Windows、PowerShell 7、Python 3 和 Claude Code：
+
+- 在终端输入 `pwsh` 可检查 PowerShell 7；找不到命令时先从 Microsoft Store 安装，随后重开终端。
+- 安装 Python 3 时须勾选 **Add Python to PATH**。
+- 若取得的是 GitHub 仓库，使用 **Code → Download ZIP** 下载；若取得的是别人发送的 ZIP，直接解压即可。
+- 建议解压到简单路径，例如 `C:\lan-proxy`，并进入真正包含 `install.ps1`、`lan.cmd`、`main.py`、`requirements.txt` 与 `.env.example` 的那一层。
+
+上游的 `app-xxxx` 是额度凭据，不要转发或随截图外传。
+
+### 执行安装
+
+在上述目录中打开终端，运行：
 
 ```powershell
-cd <仓库>
 pwsh -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-然后**新开**终端输入 `lan`。首次会从 `.env.example` 生成 `.env`——把 `DIFY_USER_ID`
-改成你自己的名字（会话与缓存按它分桶，分享时勿相同）。
+必须使用 PowerShell 7 的 `pwsh`，不要替换成旧版 `powershell`。安装成功时会看到类似：
+
+```text
+Installed.
+1) Open a NEW PowerShell 7 window
+2) Type: lan
+3) Keep the window open while chatting
+URL: http://127.0.0.1:7272
+```
+
+安装后新开终端。首次安装会从 `.env.example` 生成 `.env`；用文本编辑器将
+`DIFY_USER_ID=Liu Sheng` 改成自己的名字。该值用于 Dify user、本地会话与缓存分桶，分享给多人时不可共用；使用 CC Switch 时，`.env` 中的 `DIFY_API_KEY` 可以留空。
 
 安装脚本还会把 `SubagentStart` / `SubagentStop` 两个 Claude Code hook 合并进
-`%USERPROFILE%\.claude\settings.json`。它只替换本代理自己的 `claude_hook.py` 条目，保留
-已有 hooks、env 和权限；hook 故障会 fail-open，不阻断 Claude Code。
+`%USERPROFILE%\.claude\settings.json`。它只替换本代理自己的 `claude_hook.py` 条目，保留已有 hooks、env 和权限；hook 故障会 fail-open，不阻断 Claude Code。
 
-可选状态栏（底栏显示按次账本）：`pwsh -File .\install.ps1 -StatusLine`。
+可选状态栏（底栏显示按次账本）：
+
+```powershell
+pwsh -File .\install.ps1 -StatusLine
+```
 
 ## 接入 Claude Code
 
-两种方式任选：
+两种方式任选其一。
 
-**CC Switch**：Base URL `http://127.0.0.1:7272` · API Key `app-xxxx`（岚的应用密钥）·
-格式 Anthropic Messages · Routing 关 · Model **`alan`**。若使用“获取模型”，选择代理
-发布的 **岚**（id `anthropic/alan`）。
+### CC Switch
 
-**settings.json env**（无 CC Switch 时）：
+```text
+Base URL: http://127.0.0.1:7272
+API Key: app-xxxx（岚的应用密钥）
+格式: Anthropic Messages
+Routing: 关闭
+Model: alan
+```
+
+若使用“获取模型”，选择显示为“岚”的 `anthropic/alan`。
+
+CC Switch 不代替 Claude Code 自身的等待设置。在 Claude Code 的 `settings.json` 的 `env` 中同时保留：
+
+```json
+"API_TIMEOUT_MS": "2333333",
+"CLAUDE_STREAM_IDLE_TIMEOUT_MS": "2333333"
+```
+
+### `settings.json` 环境变量
+
+不使用 CC Switch 时配置：
 
 ```json
 {
@@ -55,54 +94,77 @@ pwsh -ExecutionPolicy Bypass -File .\install.ps1
 }
 ```
 
-日常 model 填 **`alan`** → 主档；model 名含 `haiku` → 快速档。
-话里带口令 **`testandlife`** 可强制快速档冒烟（勿用短词 test）。
+日常 model 填 `alan` 走主档；model 名含 `haiku` 走快速档。话里带口令 `testandlife` 可强制快速档冒烟，勿用短词 `test`。
 
-代理不宣称或改写 Claude Code 的上下文窗口。Dify inputs 有两道独立边界：Start 表单按
-`GET /parameters` 发布的 `max_length` 计 Unicode 字符；conversation 持久变量在下一轮恢复时
-受当前 Dify 路径实测的 `sys.getsizeof <= 204800` 约束。代理仅在确实降低内存时，把非 BMP
-字符转换为可逆 Unicode 线缆表示，并在答复返回前还原；随后分别预检两道边界。已知越界均
-返回 `400 invalid_request_error`，不裁剪、不发送，绝不伪报成会诱发 Claude Code 压缩的
-`413`。参数读取失败时沿用缓存或仅对表单边界放行。
+## 日常使用
 
-若 `Tool_invocation`、`Current_Context` 或 `History` 在线缆处理后仍超限，代理只使用 Dify
-已发布的同名编号槽无损分片。本机当前部署基线是
-`C:\Users\杨\Desktop\Key chain\AI 装置\本地代理\岚.yml`；它含隐私配置，已被
-`.gitignore` 排除，不会随公开 GitHub 仓库分发。该文件在本机应完成以下分组配置：
-`Tool_invocation_1…11`、`History_1`、`Current_Context_1…2` 均为可选 Paragraph，
-`max_length=233333`，并已接入 conversation variables、开始节点、变量赋值器及三个 LLM
-提示词。导入 Dify 后仍须**发布**应用；发布后重启 `lan`，使五分钟参数缓存立即失效。
+1. 新开 PowerShell 7 或终端，输入 `lan`。
+2. 保持 lan 窗口开启。
+3. 打开 Claude Code，选择或填写模型 `alan`，正常工作。
+4. 任务结束后先退出 Claude Code，再关闭 lan 窗口。
 
-普通请求仍走原字段；超限时原字段作为第 0 片，与编号槽连续承载。所有未用编号槽每枪也会发送空串，覆盖上轮残留。
-`GET /parameters` 未出现这些槽时，代理不会猜测它们存在，仍以 400 拒绝并给出接线提示。
-已经因旧持久变量超限而无法恢复的 conversation 不能原地自愈；发布后须通过
-`POST /sessions/new` 解绑一次，或改用新的 Claude Code 会话，让完整请求建立新的 Dify
-conversation。
+可在浏览器打开 `http://127.0.0.1:7272/health` 检查本机服务。它只证明 lan 能响应，不证明密钥、Dify 已发布应用或上游模型可用。
 
-### 长任务与自动重试
+子代理的动作状态由 lan 本地生成，不访问 Dify；真正的审视、分析请求仍走模型链。主会话与子代理分别绑定 Dify conversation，详细身份与完成报告边界见 [架构.md](./架构.md)「子代理身份、CID 与报告」。
 
-机制见 [架构.md](./架构.md)「长任务、断线与同枪重试」。此处只讲要配什么：
+## 输入边界与 Dify 部署
 
-Claude Code 的流式空闲看门狗独立于总 API timeout；若任务期间确实存在超过看门狗阈值的
-无事件空窗，再按实际最长空窗设置 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，并确保
-`API_TIMEOUT_MS` 足够覆盖总时长。不要把固定的“五分钟”当作当前版本的硬编码结论；本代理
-的传输轨迹用于确认究竟是上游无事件、代理未转译，还是下游写入失败。配置保存后，lan 的
-代码改动仍须重启 lan 进程。
+lan 不宣称或改写 Claude Code 的上下文窗口。Dify inputs 有两道不同边界：Start 表单按已发布的 `/parameters.max_length` 计 Unicode 字符；conversation 持久变量在下一轮恢复时另受当前路径实测的 `sys.getsizeof <= 204800` 约束。
 
-日志以 `req=<请求号>` 和 `flight=start|join|replay` 区分交错请求，并分别记录
-`upstream done` 与 `delivery_status`——前者只表示 lan 收完 Dify 事件，不等于 Claude Code 已收到。
-本地短路日志中的 `local_response_ready` 只表示代理构造好了本地响应，也不等于客户端已收到。
-每份请求 JSON 旁还有同名 `.trace.jsonl`：只记录 Dify 首/末事件、异常、Anthropic SSE
-事件类型与 ASGI 实际发送结果，不记录 SSE data 正文或鉴权头。`GET /debug/last-request` 会直接
-附带最近 40 条轨迹；完整文件名见 `summary.transport_trace_file`。请求摘要仍可能包含短的
-路径、query 头部或回答头部，分享前请自行确认。
+代理只在确实降低内存时使用可逆 Unicode 线缆，并只向 `/parameters` 已发布的同名编号槽无损分片。已知越界返回 Anthropic 形状的 `400 invalid_request_error`，不裁剪、不发送、不计费，也不伪报为会诱发 Claude Code 压缩的 `413`。完整契约见 [架构.md](./架构.md)「Dify 两道输入边界」与「单变量无损分片」。
 
-## 环境变量（`.env`）
+本机私有的 `岚.yml` 承载 Dify 部署基线，不随仓库分发。DSL 更新后仍须在 Dify 导入并**发布**，再重启 lan 使参数缓存失效；代理不会猜测未发布的编号槽存在。已经被旧持久变量卡住的会话不能原地自愈，发布后须 `POST /sessions/new` 解绑一次，或新开 Claude Code 会话。
+
+## 长任务与传输取证
+
+Claude Code 的流式空闲看门狗独立于总 API timeout。只有轨迹证明确有长时间无事件空窗时，才按实测最长空窗设置 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`，并让 `API_TIMEOUT_MS` 覆盖总时长；不要把固定的“五分钟”当成当前版本结论。
+
+日志以 `req=<请求号>` 和 `flight=start|join|replay` 区分请求。每份请求 JSON 旁的同名 `.trace.jsonl` 记录 Dify 首末事件、异常、Anthropic SSE 事件类型与 ASGI 发送结果，不保存 SSE data 正文或鉴权头。`GET /debug/last-request` 附带最近 40 条轨迹；完整文件名见 `summary.transport_trace_file`。请求摘要仍可能包含短路径、query 或回答头部，分享前须检查。
+
+机制说明见 [架构.md](./架构.md)「长任务、断线与同枪重试」。修改 `.py` 后必须重启运行中的 lan；保存 Claude Code 的超时配置不要求重启 lan。
+
+## 常见问题
+
+### 输入 `lan` 后提示找不到命令
+
+安装后先关闭旧终端并新开 PowerShell 7。仍不行时进入代理目录运行：
+
+```powershell
+.\lan.cmd
+```
+
+### 提示 `python not found`
+
+重新安装或修复 Python 3，勾选 **Add Python to PATH**，随后重开终端。
+
+### Claude Code 连接失败
+
+依次检查：lan 窗口仍开启、`/health` 可访问、Base URL 为 `http://127.0.0.1:7272`、API Key 正确、CC Switch 的 Routing 已关闭、Model 为 `alan` 或 `anthropic/alan`。
+
+### 回答串到旧会话
+
+先检查 `.env` 的 `DIFY_USER_ID` 是否与其他使用者重名。需要放弃旧 conversation 时使用 `POST /sessions/new`，或新开 Claude Code 会话。
+
+### 长任务中途断开
+
+先查对应请求的 `.trace.jsonl`，区分上游无事件、代理未转译与下游发送失败；不要只凭经过时长判断。Dify 已接受的任务即使下游断开仍可能完成并产生额度消耗。
+
+### 子代理显示完成，主模型仍说在运行
+
+检查请求日志中的 `agent_report_source`、`agent_archive_reports` 与 `hook_identity_status`。可信完成通知优先来自消息链；fork 后缺失旧 transcript 时，lan 才从有界档案恢复一次。身份缺失或无效会回落普通模型链，详细规则见 [架构.md](./架构.md) 对应章节。
+
+### 向柳生反馈错误
+
+优先提供 Claude Code 报错截图、lan 终端截图，以及 `http://127.0.0.1:7272/debug/last-request` 的页面截图。该页面隐藏原始请求正文和鉴权信息，但摘要可能含短路径、query 或回答头部，发送前仍须检查。
+
+## 配置与端点
+
+### `.env`
 
 | 键 | 默认 | 含义 |
 |:---|:---|:---|
 | `DIFY_BASE_URL` | `https://api.dify.ai/v1` | 上游 |
-| `DIFY_USER_ID` | `Liu Sheng`（这是柳生的ID，你要填你自己的） | Dify user + 本地状态分桶 |
+| `DIFY_USER_ID` | `Liu Sheng` | Dify user + 本地状态分桶；必须改为使用者自己的名字 |
 | `DIFY_API_KEY` | 空 | 兜底 Key（优先用请求头） |
 | `HOST` / `PORT` | `127.0.0.1` / `7272` | 监听 |
 | `ADMIN_TOKEN` | 空（仅本机免 token） | 外部监听时保护会话、账本重置和调试管理端点 |
@@ -111,76 +173,28 @@ Claude Code 的流式空闲看门狗独立于总 API timeout；若任务期间�
 | `OPUS_USD_PER_CALL` / `HAIKU_USD_PER_CALL` | `1.0` / `0.0` | 按次单价 |
 | `LAN_HOOK_BASE_URL` | `http://127.0.0.1:7272` | Claude Code hook 回调地址 |
 
-本地状态固定在 `data/`：`sessions.json`（CC session ↔ Dify conversation 的映射）·
-`usage.json`（账本）· `read_cache.json`（Read 缓存）· `terminal_pending.json`
-（Write/Edit 待决成功答复）· `agents.json`（子代理身份与有界完成报告）·
-`request_logs/`（每枪日志）。均有上界，不会无限增长。
-`.env` 与 `data/` 勿入库。
+`.env` 与 `data/` 不入库。`data/` 保存有界的会话、账本、Read 缓存、terminal 待决、子代理档案与请求日志；它们是内部状态，不是稳定 API，结构见 [架构.md](./架构.md)「落盘」。
 
-会话字段的读法：`by_cc[session_id]` 是主会话绑定，`by_agent[parent][agent]` 是子代理
-绑定，`current` 是没有 session id 时的候选指针。若已有 `by_cc` 映射而它不再指向其中
-任何 CID，就会被当作幽灵丢弃；`by_cc` 为空时仍允许 current-only sticky。并发 fence
-记录有界（最多 128 个 scope 键）；达到上限会失效旧 token 并重新开始计数。
-
-## 端点
+### HTTP 端点
 
 | Path | 作用 |
 |:---|:---|
 | `POST /v1/messages` | 主业务（Anthropic Messages 门面） |
-| `GET /health` | 存活 + 开关状态 + 模型身份 + terminal 待决数 + 非流共享任务数 |
+| `GET /health` | 存活、开关、模型身份及内部计数摘要 |
+| `GET /v1/models` | 模型发现（首项 `anthropic/alan`，保留旧别名兼容） |
 | `GET /v1/usage` · `…/statusline` · `POST …/reset` | 按次账本 |
 | `GET/POST /sessions` · `/sessions/new` · `/sessions/switch` | 会话绑定管理 |
-| `POST /hooks/subagent-start` · `/hooks/subagent-stop` | Claude Code 子代理 hook（本机安装脚本调用） |
-| `GET /debug/last-request` | 最近一枪（排障首选） |
-| `GET /v1/models` | 模型发现（首项 `anthropic/alan`，旧别名兼容保留） |
+| `POST /hooks/subagent-start` · `/hooks/subagent-stop` | Claude Code 子代理 hook |
+| `GET /debug/last-request` | 最近一枪的脱敏摘要与传输轨迹 |
 
-## 验收（改动后最小回归）
+外部监听（`HOST` 非 `127.0.0.1`）时必须配置 `ADMIN_TOKEN`；它保护会话管理、账本重置和调试端点。
 
-1. `python -m pytest -q` → 全绿
-2. `GET /health` → ok
-3. 主聊一句 → 思考 + 正文；日志 `route=opus`、`attach_main=true`
-4. 同时读取两个互不依赖的文件 → 首枪日志 `tool_count=2`；同文件连续 Edit 或 Write 后测试须串行
-5. 让阿岚写一个**长文件**（内容故意含 `"引号"`、`C:\路径`、代码围栏）→ 落盘完整；
-   日志 `stop_reason=tool_use`、`envelope=true`（结构化出口）或 `tool_inputs[].input_head`
-   出现该文件路径（文本协议）。`input_head` 是截断头部——每项 400 字符、最多 8 项，
-   验收看的是落盘文件完整，不是日志字段完整
-6. 若该 Write 是任务终点 → 结果枪日志 `gun_kind=terminal_local`、`skipped_dify=true`，usage
-   不增加；故意拒绝写入 → 回 Dify 正常解释并计续写枪
-7. 新开 CC 对话再聊 → 日志 `session_bind=miss` 且不带旧 `conversation_id_out`；同窗续聊 → `hit`
-8. `/compact` → `gun_kind=compact`、`route=opus`（压缩质量优先）、`attach_main=false`、`trim=empty`
-9. 贴图提问 → `dify_files≥1`（岚须允许 image 上传）；失败须见 `[[cc_images:failed]]`
-10. 并发发送两个完全相同的非流请求 → 日志一条 `start`、一条 `join`，Dify 与 usage 都只增 1
-11. `GET /v1/usage` 次数与实际进入 Dify 的枪数对得上
-12. 子代理动作状态请求 → `gun_kind=status`、`route=local`、`skipped_dify=true`，usage 不增加
-13. 同父会话派两个同文本子代理 → 两个独立 CID；各自续写复用自己的 CID，主 CID 不变
-14. 删除编码、兼容、边界、重试、缓存或恢复机制前 → 按 [经验.md](./经验.md) 守则 22
-    建立故障复现与反事实对照；证据不足只登记候选，不直接删除
+## 维护入口
 
-排障链：UI 现象 → `GET /debug/last-request` → 最新请求 JSON 与同名 `.trace.jsonl`。
-`summary` 看路由与交付状态，`response` 看模型收尾，`transport_trace` 看 Dify 接收、代理生成
-和 Claude Code 发送三段边界。
+自动回归入口：
 
-外部监听（`HOST` 非 `127.0.0.1`）时必须配置 `ADMIN_TOKEN`；它保护会话管理、账本重置
-和调试端点。调试端点只返回日志摘要，原始请求正文默认脱敏。
+```powershell
+python -m pytest -q
+```
 
-## 代码地图
-
-| 文件 | 职责 |
-|:---|:---|
-| `main.py` | HTTP 入口与编排 |
-| `agent_bridge.py` | hook 身份 marker、子代理完成档案与 fork 报告兜底 |
-| `claude_hook.py` | Claude Code `SubagentStart` / `SubagentStop` command hook |
-| `protocol.py` | 模型身份发布与兼容别名 |
-| `plan.py` | 判枪：旁路 / 子代理 / 状态枪 / 路由 / 流式 / 结构化 |
-| `status.py` | 本地动作状态识别与事实短句生成 |
-| `parse.py` | CC 请求折叠 → inputs / query / History；图抽取 |
-| `outbound.py` | 出站装配：缓存重放、标记、注入、附图 |
-| `unicode_wire.py` | 非 BMP 可逆线缆、流式还原与 Dify 持久变量内存边界 |
-| `singleflight.py` | 非流请求指纹、并发合并、断线续跑与短期结果回放 |
-| `tools.py` | 工具通道：协议文本、目录、三通道解析、归一 |
-| `answer.py` | Dify 流 → Anthropic SSE / JSON |
-| `dify.py` | 上游 I/O：应用参数缓存、chat-messages、图上传 |
-| `岚.yml`（本机私有） | Dify「岚」的可导入 DSL；路径为 `C:\Users\杨\Desktop\Key chain\AI 装置\本地代理\岚.yml`，不随公开仓库分发 |
-| `terminal.py` | terminal-tool 待决状态、成功判定、会话隔离与过期 |
-| `cache.py` / `sessions.py` / `meter.py` / `log.py` | Read 缓存 / 主子会话绑定 / 按次账 / 落盘与日志字段表 |
-| `persist.py` | 本地状态共用原语：原子写盘、JSON 装载容错、UTC 时间约定 |
+具体端到端验收按受影响契约选择，不在 README 复制完整机制清单。修改代码前先读 [架构.md](./架构.md) 的对应控制链与 [经验.md](./经验.md) 的保护原因；删除编码、兼容、边界、重试、缓存、会话或恢复机制前，必须先完成证据链。`GET /health` 不是上游联调证明，真实 Dify / Claude Code 验证会消耗额度或改变外部状态，须由任务明确授权。
