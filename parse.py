@@ -707,12 +707,6 @@ def _agent_lifecycle_context(
     )
 
 
-def extract_agent_lifecycle(messages: list) -> dict[str, list[dict[str, Any]]]:
-    """兼容调用面：返回消息链中的 Agent 生命周期。"""
-    lifecycle, _promoted, _trusted, _calls = _agent_lifecycle_context(messages)
-    return lifecycle
-
-
 def _tool_trace_index(messages: list) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     calls: dict[str, dict[str, Any]] = {}
     results: dict[str, dict[str, Any]] = {}
