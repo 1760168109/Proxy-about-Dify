@@ -72,7 +72,6 @@ _REL_PATH_RE = re.compile(
 )
 _EMAIL_RE = re.compile(r"(?<![/\\])\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 
-NEED_READ_MARKER = "[[cc_need_read]]"
 NEED_READ_NOTE = (
     "[[cc_need_read]]\n"
     "本轮用户引用了工作区文件，但上下文尚无文件正文。"
